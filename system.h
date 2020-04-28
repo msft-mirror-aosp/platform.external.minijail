@@ -47,7 +47,7 @@ int cap_ambient_supported(void);
 int config_net_loopback(void);
 
 int setup_pipe_end(int fds[2], size_t index);
-int dupe_and_close_fd(int fds[2], size_t index, int fd);
+int setup_and_dupe_pipe_end(int fds[2], size_t index, int fd);
 
 int write_pid_to_path(pid_t pid, const char *path);
 int write_proc_file(pid_t pid, const char *content, const char *basename);
@@ -59,9 +59,6 @@ int setup_mount_destination(const char *source, const char *dest, uid_t uid,
 
 int lookup_user(const char *user, uid_t *uid, gid_t *gid);
 int lookup_group(const char *group, gid_t *gid);
-
-int seccomp_ret_log_available(void);
-int seccomp_ret_kill_process_available(void);
 
 #ifdef __cplusplus
 }; /* extern "C" */

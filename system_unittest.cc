@@ -187,10 +187,10 @@ TEST(setup_pipe_end, index1) {
 }
 
 // Invalid indexes should return errors, not crash.
-TEST(dupe_and_close_fd, bad_index) {
-  EXPECT_LT(dupe_and_close_fd(nullptr, 2, -1), 0);
-  EXPECT_LT(dupe_and_close_fd(nullptr, 3, -1), 0);
-  EXPECT_LT(dupe_and_close_fd(nullptr, 4, -1), 0);
+TEST(setup_and_dupe_pipe_end, bad_index) {
+  EXPECT_LT(setup_and_dupe_pipe_end(nullptr, 2, -1), 0);
+  EXPECT_LT(setup_and_dupe_pipe_end(nullptr, 3, -1), 0);
+  EXPECT_LT(setup_and_dupe_pipe_end(nullptr, 4, -1), 0);
 }
 
 // An invalid path should return an error.
@@ -260,7 +260,7 @@ TEST(setup_mount_destination, dest_exists) {
   EXPECT_EQ(0, setup_mount_destination(nullptr, "/dev", 0, 0, false, nullptr));
 }
 
-// Mount flags should be obtained for bind-mounts.
+// Mount flags should be obtained for bind-mounts
 TEST(setup_mount_destination, mount_flags) {
   struct statvfs stvfs_buf;
   ASSERT_EQ(0, statvfs("/proc", &stvfs_buf));
@@ -361,9 +361,4 @@ TEST(setup_mount_destination, create_char_dev) {
                                        false, nullptr));
   // We check it's a directory by deleting it as such.
   EXPECT_EQ(0, rmdir(child_dev.c_str()));
-}
-
-TEST(seccomp_actions_available, smoke) {
-  seccomp_ret_log_available();
-  seccomp_ret_kill_process_available();
 }

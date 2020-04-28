@@ -78,14 +78,8 @@ int main(int argc, char** argv) {
   if (!f)
     pdie("fopen(%s) failed", argv[1]);
 
-  struct filter_options fopts {
-    .action = ACTION_RET_KILL,
-    .allow_logging = 0,
-    .allow_syscalls_for_logging = 0,
-  };
-
   struct sock_fprog fp;
-  int res = compile_filter(argv[1], f, &fp, &fopts);
+  int res = compile_filter(argv[1], f, &fp, 0, 0);
   fclose(f);
   if (res != 0)
     die("compile_filter failed");

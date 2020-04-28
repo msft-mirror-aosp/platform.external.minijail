@@ -163,7 +163,6 @@ struct minijail {
 		int close_open_fds : 1;
 		int new_session_keyring : 1;
 		int forward_signals : 1;
-		int setsid : 1;
 	} flags;
 	uid_t uid;
 	gid_t gid;
@@ -238,7 +237,6 @@ void minijail_preenter(struct minijail *j)
 	j->flags.pid_file = 0;
 	j->flags.cgroups = 0;
 	j->flags.forward_signals = 0;
-	j->flags.setsid = 0;
 	j->remount_mode = 0;
 }
 
@@ -382,17 +380,6 @@ void API minijail_set_seccomp_filter_tsync(struct minijail *j)
 		die("minijail_set_seccomp_filter_tsync() must be called "
 		    "before minijail_parse_seccomp_filters()");
 	}
-
-	if (j->flags.seccomp_filter_logging && !seccomp_ret_log_available()) {
-		/*
-		 * If SECCOMP_RET_LOG is not available, we don't want to use
-		 * SECCOMP_RET_TRAP to both kill the entire process and report
-		 * failing syscalls, since it will be brittle. Just bail.
-		 */
-		die("SECCOMP_RET_LOG not available, cannot use logging with "
-		    "thread sync at the same time");
-	}
-
 	j->flags.seccomp_filter_tsync = 1;
 }
 
@@ -402,23 +389,11 @@ void API minijail_log_seccomp_filter_failures(struct minijail *j)
 		die("minijail_log_seccomp_filter_failures() must be called "
 		    "before minijail_parse_seccomp_filters()");
 	}
-
-	if (j->flags.seccomp_filter_tsync && !seccomp_ret_log_available()) {
-		/*
-		 * If SECCOMP_RET_LOG is not available, we don't want to use
-		 * SECCOMP_RET_TRAP to both kill the entire process and report
-		 * failing syscalls, since it will be brittle. Just bail.
-		 */
-		die("SECCOMP_RET_LOG not available, cannot use thread sync with "
-		    "logging at the same time");
-	}
-
-	if (debug_logging_allowed()) {
-		j->flags.seccomp_filter_logging = 1;
-	} else {
-		warn("non-debug build: ignoring request to enable seccomp "
-		     "logging");
-	}
+#ifdef ALLOW_DEBUG_LOGGING
+	j->flags.seccomp_filter_logging = 1;
+#else
+	warn("non-debug build: ignoring request to enable seccomp logging");
+#endif
 }
 
 void API minijail_use_caps(struct minijail *j, uint64_t capmask)
@@ -758,11 +733,6 @@ int API minijail_forward_signals(struct minijail *j)
 	return 0;
 }
 
-int API minijail_create_session(struct minijail *j) {
-	j->flags.setsid = 1;
-	return 0;
-}
-
 int API minijail_mount_with_data(struct minijail *j, const char *src,
 				 const char *dest, const char *type,
 				 unsigned long flags, const char *data)
@@ -955,17 +925,12 @@ static int seccomp_should_use_filters(struct minijail *j)
 }
 
 static int set_seccomp_filters_internal(struct minijail *j,
-					const struct sock_fprog *filter,
-					bool owned)
+					struct sock_fprog *filter, bool owned)
 {
 	struct sock_fprog *fprog;
 
 	if (owned) {
-		/*
-		 * If |owned| is true, it's OK to cast away the const-ness since
-		 * we'll own the pointer going forward.
-		 */
-		fprog = (struct sock_fprog *)filter;
+		fprog = filter;
 	} else {
 		fprog = malloc(sizeof(struct sock_fprog));
 		if (!fprog)
@@ -990,48 +955,45 @@ static int set_seccomp_filters_internal(struct minijail *j,
 	return 0;
 }
 
+void API minijail_set_seccomp_filters(struct minijail *j,
+				      const struct sock_fprog *filter)
+{
+	if (!seccomp_should_use_filters(j))
+		return;
+
+	if (j->flags.seccomp_filter_logging) {
+		die("minijail_log_seccomp_filter_failures() is incompatible "
+		    "with minijail_set_seccomp_filters()");
+	}
+
+	/*
+	 * set_seccomp_filters_internal() can only fail with ENOMEM.
+	 * Furthermore, since we won't own the incoming filter, it will not be
+	 * modified.
+	 */
+	if (set_seccomp_filters_internal(j, (struct sock_fprog *)filter,
+					 false) < 0) {
+		die("failed to copy seccomp filter");
+	}
+}
+
 static int parse_seccomp_filters(struct minijail *j, const char *filename,
 				 FILE *policy_file)
 {
 	struct sock_fprog *fprog = malloc(sizeof(struct sock_fprog));
 	if (!fprog)
 		return -ENOMEM;
+	int use_ret_trap =
+	    j->flags.seccomp_filter_tsync || j->flags.seccomp_filter_logging;
+	int allow_logging = j->flags.seccomp_filter_logging;
 
-	struct filter_options filteropts;
-
-	/*
-	 * Figure out filter options.
-	 * Allow logging?
-	 */
-	filteropts.allow_logging =
-	    debug_logging_allowed() && j->flags.seccomp_filter_logging;
-
-	/* What to do on a blocked system call? */
-	if (filteropts.allow_logging) {
-		if (seccomp_ret_log_available())
-			filteropts.action = ACTION_RET_LOG;
-		else
-			filteropts.action = ACTION_RET_TRAP;
-	} else {
-		if (j->flags.seccomp_filter_tsync)
-			filteropts.action = ACTION_RET_TRAP;
-		else
-			filteropts.action = ACTION_RET_KILL;
-	}
-
-	/*
-	 * If SECCOMP_RET_LOG is not available, need to allow extra syscalls
-	 * for logging.
-	 */
-	filteropts.allow_syscalls_for_logging =
-	    filteropts.allow_logging && !seccomp_ret_log_available();
-
-	if (compile_filter(filename, policy_file, fprog, &filteropts)) {
+	if (compile_filter(filename, policy_file, fprog, use_ret_trap,
+			   allow_logging)) {
 		free(fprog);
 		return -1;
 	}
 
-	return set_seccomp_filters_internal(j, fprog, true /* owned */);
+	return set_seccomp_filters_internal(j, fprog, true);
 }
 
 void API minijail_parse_seccomp_filters(struct minijail *j, const char *path)
@@ -1077,27 +1039,6 @@ void API minijail_parse_seccomp_filters_from_fd(struct minijail *j, int fd)
 	}
 	free(path);
 	fclose(file);
-}
-
-void API minijail_set_seccomp_filters(struct minijail *j,
-				      const struct sock_fprog *filter)
-{
-	if (!seccomp_should_use_filters(j))
-		return;
-
-	if (j->flags.seccomp_filter_logging) {
-		die("minijail_log_seccomp_filter_failures() is incompatible "
-		    "with minijail_set_seccomp_filters()");
-	}
-
-	/*
-	 * set_seccomp_filters_internal() can only fail with ENOMEM.
-	 * Furthermore, since we won't own the incoming filter, it will not be
-	 * modified.
-	 */
-	if (set_seccomp_filters_internal(j, filter, false /* owned */) < 0) {
-		die("failed to set seccomp filter");
-	}
 }
 
 int API minijail_use_alt_syscall(struct minijail *j, const char *table)
@@ -1542,9 +1483,7 @@ static int mount_one(const struct minijail *j, struct mountpoint *m,
 
 	/* We assume |dest| has a leading "/". */
 	if (dev_path && strncmp("/dev/", m->dest, 5) == 0) {
-		/*
-		 * Since the temp path is rooted at /dev, skip that dest part.
-		 */
+		/* Since the temp path is rooted at /dev, skip that dest part. */
 		if (asprintf(&dest, "%s%s", dev_path, m->dest + 4) < 0)
 			return -ENOMEM;
 	} else {
@@ -1794,17 +1733,14 @@ static void write_ugid_maps_or_die(const struct minijail *j)
 	if (j->uidmap && write_proc_file(j->initpid, j->uidmap, "uid_map") != 0)
 		kill_child_and_die(j, "failed to write uid_map");
 	if (j->gidmap && j->flags.disable_setgroups) {
-		/*
-		 * Older kernels might not have the /proc/<pid>/setgroups files.
-		 */
+		/* Older kernels might not have the /proc/<pid>/setgroups files. */
 		int ret = write_proc_file(j->initpid, "deny", "setgroups");
 		if (ret != 0) {
 			if (ret == -ENOENT) {
 				/* See http://man7.org/linux/man-pages/man7/user_namespaces.7.html. */
 				warn("could not disable setgroups(2)");
 			} else
-				kill_child_and_die(
-				    j, "failed to disable setgroups(2)");
+				kill_child_and_die(j, "failed to disable setgroups(2)");
 		}
 	}
 	if (j->gidmap && write_proc_file(j->initpid, j->gidmap, "gid_map") != 0)
@@ -2016,16 +1952,13 @@ static void set_seccomp_filter(const struct minijail *j)
 
 	if (j->flags.seccomp_filter) {
 		if (j->flags.seccomp_filter_logging) {
+			/*
+			 * If logging seccomp filter failures,
+			 * install the SIGSYS handler first.
+			 */
+			if (install_sigsys_handler())
+				pdie("failed to install SIGSYS handler");
 			warn("logging seccomp filter failures");
-			if (!seccomp_ret_log_available()) {
-				/*
-				 * If SECCOMP_RET_LOG is not available,
-				 * install the SIGSYS handler first.
-				 */
-				if (install_sigsys_handler())
-					pdie(
-					    "failed to install SIGSYS handler");
-			}
 		} else if (j->flags.seccomp_filter_tsync) {
 			/*
 			 * If setting thread sync,
@@ -2164,15 +2097,12 @@ void API minijail_enter(const struct minijail *j)
 			pdie("unshare(CLONE_NEWNS) failed");
 		/*
 		 * By default, remount all filesystems as private, unless
-		 * - Passed a specific remount mode, in which case remount with
-		 *   that,
-		 * - Asked not to remount at all, in which case skip the
-		 *   mount(2) call.
+		 * - Passed a specific remount mode, in which case remount with that,
+		 * - Asked not to remount at all, in which case skip the mount(2) call.
 		 * https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt
 		 */
 		if (j->remount_mode) {
-			if (mount(NULL, "/", NULL, MS_REC | j->remount_mode,
-				  NULL))
+			if (mount(NULL, "/", NULL, MS_REC | j->remount_mode, NULL))
 				pdie("mount(NULL, /, NULL, MS_REC | MS_PRIVATE,"
 				     " NULL) failed");
 		}
@@ -2743,12 +2673,11 @@ static int minijail_run_internal(struct minijail *j,
 	}
 
 	/*
-         * If the parent process needs to configure the child's runtime
-         * environment after forking, create a pipe(2) to block the child until
-         * configuration is done.
+	 * If we want to set up a new uid/gid map in the user namespace,
+	 * or if we need to add the child process to cgroups, create the pipe(2)
+	 * to sync between parent and child.
 	 */
-	if (j->flags.forward_signals || j->flags.pid_file || j->flags.cgroups ||
-	    j->rlimit_count || j->flags.userns) {
+	if (j->flags.userns || j->flags.cgroups) {
 		sync_child = 1;
 		if (pipe(child_sync_pipe_fds))
 			return -EFAULT;
@@ -2808,11 +2737,7 @@ static int minijail_run_internal(struct minijail *j,
 		if (use_preload) {
 			free(oldenv_copy);
 		}
-		if (pid_namespace && errno == EPERM) {
-			warn("clone(CLONE_NEWPID) failed with EPERM, maybe "
-			     "this process is not running with CAP_SYS_ADMIN?");
-		}
-		pdie("failed to fork child");
+		die("failed to fork child");
 	}
 
 	if (child_pid) {
@@ -2952,17 +2877,6 @@ static int minijail_run_internal(struct minijail *j,
 			inheritable_fds[size++] = stderr_fds[0];
 			inheritable_fds[size++] = stderr_fds[1];
 		}
-
-		/*
-		 * Preserve namespace file descriptors over the close_open_fds()
-		 * call. These are closed in minijail_enter() so they won't leak
-		 * into the child process.
-		 */
-		if (j->flags.enter_vfs)
-			minijail_preserve_fd(j, j->mountns_fd, j->mountns_fd);
-		if (j->flags.enter_net)
-			minijail_preserve_fd(j, j->netns_fd, j->netns_fd);
-
 		for (i = 0; i < j->preserved_fd_count; i++) {
 			/*
 			 * Preserve all parent_fds. They will be dup2(2)-ed in
@@ -2989,8 +2903,8 @@ static int minijail_run_internal(struct minijail *j,
 	 * set up the read end of the pipe.
 	 */
 	if (status_out->pstdin_fd) {
-		if (dupe_and_close_fd(stdin_fds, 0 /* read end */,
-                          STDIN_FILENO) < 0)
+		if (setup_and_dupe_pipe_end(stdin_fds, 0 /* read end */,
+					    STDIN_FILENO) < 0)
 			die("failed to set up stdin pipe");
 	}
 
@@ -2999,8 +2913,8 @@ static int minijail_run_internal(struct minijail *j,
 	 * set up the write end of the pipe.
 	 */
 	if (status_out->pstdout_fd) {
-		if (dupe_and_close_fd(stdout_fds, 1 /* write end */,
-                          STDOUT_FILENO) < 0)
+		if (setup_and_dupe_pipe_end(stdout_fds, 1 /* write end */,
+					    STDOUT_FILENO) < 0)
 			die("failed to set up stdout pipe");
 	}
 
@@ -3009,21 +2923,21 @@ static int minijail_run_internal(struct minijail *j,
 	 * set up the write end of the pipe.
 	 */
 	if (status_out->pstderr_fd) {
-		if (dupe_and_close_fd(stderr_fds, 1 /* write end */,
-                          STDERR_FILENO) < 0)
+		if (setup_and_dupe_pipe_end(stderr_fds, 1 /* write end */,
+					    STDERR_FILENO) < 0)
 			die("failed to set up stderr pipe");
 	}
 
 	/*
-	 * If any of stdin, stdout, or stderr are TTYs, or setsid flag is
-	 * set, create a new session. This prevents the jailed process from
-	 * using the TIOCSTI ioctl to push characters into the parent process
-	 * terminal's input buffer, therefore escaping the jail.
+	 * If any of stdin, stdout, or stderr are TTYs, create a new session.
+	 * This prevents the jailed process from using the TIOCSTI ioctl
+	 * to push characters into the parent process terminal's input buffer,
+	 * therefore escaping the jail.
 	 *
 	 * Since it has just forked, the child will not be a process group
 	 * leader, and this call to setsid() should always succeed.
 	 */
-	if (j->flags.setsid || isatty(STDIN_FILENO) || isatty(STDOUT_FILENO) ||
+	if (isatty(STDIN_FILENO) || isatty(STDOUT_FILENO) ||
 	    isatty(STDERR_FILENO)) {
 		if (setsid() < 0) {
 			pdie("setsid() failed");
@@ -3102,37 +3016,28 @@ static int minijail_run_internal(struct minijail *j,
 	 *   -> init()-ing process
 	 *      -> execve()-ing process
 	 */
-	execve(config->filename, config->argv, child_env);
-
-	ret = (errno == ENOENT ? MINIJAIL_ERR_NO_COMMAND : MINIJAIL_ERR_NO_ACCESS);
-	pwarn("execve(%s) failed", config->filename);
+	ret = execve(config->filename, config->argv, child_env);
+	if (ret == -1) {
+		pwarn("execve(%s) failed", config->filename);
+	}
 	_exit(ret);
 }
 
 int API minijail_kill(struct minijail *j)
 {
-	if (j->initpid <= 0)
-		return -ECHILD;
-
+	int st;
 	if (kill(j->initpid, SIGTERM))
 		return -errno;
-
-	return minijail_wait(j);
+	if (waitpid(j->initpid, &st, 0) < 0)
+		return -errno;
+	return st;
 }
 
 int API minijail_wait(struct minijail *j)
 {
-	if (j->initpid <= 0)
-		return -ECHILD;
-
 	int st;
-	while (true) {
-		const int ret = waitpid(j->initpid, &st, 0);
-		if (ret >= 0)
-			break;
-		if (errno != EINTR)
-			return -errno;
-	}
+	if (waitpid(j->initpid, &st, 0) < 0)
+		return -errno;
 
 	if (!WIFEXITED(st)) {
 		int error_status = st;
@@ -3150,7 +3055,7 @@ int API minijail_wait(struct minijail *j)
 			if (signum == SIGSYS) {
 				error_status = MINIJAIL_ERR_JAIL;
 			} else {
-				error_status = MINIJAIL_ERR_SIG_BASE + signum;
+				error_status = 128 + signum;
 			}
 		}
 		return error_status;

@@ -137,13 +137,6 @@ void append_ret_errno(struct filter_block *head, int errno_val)
 	append_filter_block(head, filter, ONE_INSTR);
 }
 
-void append_ret_log(struct filter_block *head)
-{
-	struct sock_filter *filter = new_instr_buf(ONE_INSTR);
-	set_bpf_ret_log(filter);
-	append_filter_block(head, filter, ONE_INSTR);
-}
-
 void append_allow_syscall(struct filter_block *head, int nr)
 {
 	struct sock_filter *filter = new_instr_buf(ALLOW_SYSCALL_LEN);
@@ -276,7 +269,7 @@ int compile_atom(struct parser_state *state, struct filter_block *head,
 }
 
 int compile_errno(struct parser_state *state, struct filter_block *head,
-		  char *ret_errno, enum block_action action)
+		  char *ret_errno, int use_ret_trap)
 {
 	char *errno_ptr = NULL;
 
@@ -299,17 +292,10 @@ int compile_errno(struct parser_state *state, struct filter_block *head,
 
 		append_ret_errno(head, errno_val);
 	} else {
-		switch (action) {
-		case ACTION_RET_KILL:
+		if (!use_ret_trap)
 			append_ret_kill(head);
-			break;
-		case ACTION_RET_TRAP:
+		else
 			append_ret_trap(head);
-			break;
-		case ACTION_RET_LOG:
-			compiler_warn(state, "invalid action: ACTION_RET_LOG");
-			return -1;
-		}
 	}
 	return 0;
 }
@@ -318,7 +304,7 @@ struct filter_block *compile_policy_line(struct parser_state *state, int nr,
 					 const char *policy_line,
 					 unsigned int entry_lbl_id,
 					 struct bpf_labels *labels,
-					 enum block_action action)
+					 int use_ret_trap)
 {
 	/*
 	 * |policy_line| should be an expression of the form:
@@ -382,7 +368,7 @@ struct filter_block *compile_policy_line(struct parser_state *state, int nr,
 
 	/* Checks whether we're unconditionally blocking this syscall. */
 	if (strncmp(line, "return", strlen("return")) == 0) {
-		if (compile_errno(state, head, line, action) < 0) {
+		if (compile_errno(state, head, line, use_ret_trap) < 0) {
 			free_block_list(head);
 			free(line);
 			return NULL;
@@ -437,23 +423,16 @@ struct filter_block *compile_policy_line(struct parser_state *state, int nr,
 	 * otherwise just kill the task.
 	 */
 	if (ret_errno) {
-		if (compile_errno(state, head, ret_errno, action) < 0) {
+		if (compile_errno(state, head, ret_errno, use_ret_trap) < 0) {
 			free_block_list(head);
 			free(line);
 			return NULL;
 		}
 	} else {
-		switch (action) {
-		case ACTION_RET_KILL:
+		if (!use_ret_trap)
 			append_ret_kill(head);
-			break;
-		case ACTION_RET_TRAP:
+		else
 			append_ret_trap(head);
-			break;
-		case ACTION_RET_LOG:
-			append_ret_log(head);
-			break;
-		}
 	}
 
 	/*
@@ -556,13 +535,12 @@ static ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream)
 	memcpy(&line[ret + 1], next_line, next_ret + 1);
 	free(next_line);
 	*lineptr = line;
-	return *n - 1;
+	return ret;
 }
 
 int compile_file(const char *filename, FILE *policy_file,
 		 struct filter_block *head, struct filter_block **arg_blocks,
-		 struct bpf_labels *labels,
-		 const struct filter_options *filteropts,
+		 struct bpf_labels *labels, int use_ret_trap, int allow_logging,
 		 unsigned int include_level)
 {
 	/* clang-format off */
@@ -616,7 +594,8 @@ int compile_file(const char *filename, FILE *policy_file,
 				goto free_line;
 			}
 			if (compile_file(filename, included_file, head,
-					 arg_blocks, labels, filteropts,
+					 arg_blocks, labels, use_ret_trap,
+					 allow_logging,
 					 include_level + 1) == -1) {
 				compiler_warn(&state, "'@include %s' failed",
 					      filename);
@@ -652,7 +631,7 @@ int compile_file(const char *filename, FILE *policy_file,
 		if (nr < 0) {
 			compiler_warn(&state, "nonexistent syscall '%s'",
 				      syscall_name);
-			if (filteropts->allow_logging) {
+			if (allow_logging) {
 				/*
 				 * If we're logging failures, assume we're in a
 				 * debugging case and continue.
@@ -690,16 +669,14 @@ int compile_file(const char *filename, FILE *policy_file,
 			append_filter_block(head, nr_comp, ALLOW_SYSCALL_LEN);
 
 			/* Build the arg filter block. */
-			struct filter_block *block =
-			    compile_policy_line(&state, nr, policy_line, id,
-						labels, filteropts->action);
+			struct filter_block *block = compile_policy_line(
+			    &state, nr, policy_line, id, labels, use_ret_trap);
 
 			if (!block) {
 				if (*arg_blocks) {
 					free_block_list(*arg_blocks);
 					*arg_blocks = NULL;
 				}
-				warn("could not allocate filter block");
 				ret = -1;
 				goto free_line;
 			}
@@ -718,7 +695,6 @@ int compile_file(const char *filename, FILE *policy_file,
 			free_block_list(*arg_blocks);
 			*arg_blocks = NULL;
 		}
-		warn("getmultiline() failed");
 		ret = -1;
 	}
 
@@ -728,8 +704,7 @@ free_line:
 }
 
 int compile_filter(const char *filename, FILE *initial_file,
-		   struct sock_fprog *prog,
-		   const struct filter_options *filteropts)
+		   struct sock_fprog *prog, int use_ret_trap, int allow_logging)
 {
 	int ret = 0;
 	struct bpf_labels labels;
@@ -753,48 +728,26 @@ int compile_filter(const char *filename, FILE *initial_file,
 	len = bpf_load_syscall_nr(load_nr);
 	append_filter_block(head, load_nr, len);
 
-	/*
-	 * On kernels without SECCOMP_RET_LOG, Minijail can attempt to write the
-	 * first failing syscall to syslog(3). In order for syslog(3) to work,
-	 * some syscalls need to be unconditionally allowed.
-	 */
-	if (filteropts->allow_syscalls_for_logging)
+	/* If logging failures, allow the necessary syscalls first. */
+	if (allow_logging)
 		allow_logging_syscalls(head);
 
 	if (compile_file(filename, initial_file, head, &arg_blocks, &labels,
-			 filteropts, 0 /* include_level */) != 0) {
+			 use_ret_trap, allow_logging,
+			 0 /* include_level */) != 0) {
 		warn("compile_filter: compile_file() failed");
 		ret = -1;
 		goto free_filter;
 	}
 
 	/*
-	 * If none of the syscalls match, either fall through to LOG, TRAP, or
-	 * KILL.
+	 * If none of the syscalls match, either fall through to KILL,
+	 * or return TRAP.
 	 */
-	switch (filteropts->action) {
-	case ACTION_RET_KILL:
+	if (!use_ret_trap)
 		append_ret_kill(head);
-		break;
-	case ACTION_RET_TRAP:
+	else
 		append_ret_trap(head);
-		break;
-	case ACTION_RET_LOG:
-		if (filteropts->allow_logging) {
-			append_ret_log(head);
-		} else {
-			warn("compile_filter: cannot use RET_LOG without "
-			     "allowing logging");
-			ret = -1;
-			goto free_filter;
-		}
-		break;
-	default:
-		warn("compile_filter: invalid log action %d",
-		     filteropts->action);
-		ret = -1;
-		goto free_filter;
-	}
 
 	/* Allocate the final buffer, now that we know its size. */
 	size_t final_filter_len =
