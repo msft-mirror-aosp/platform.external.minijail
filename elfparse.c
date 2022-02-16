@@ -11,7 +11,6 @@
 #include <unistd.h>
 
 #include "elfparse.h"
-#include "util.h"
 
 int is_elf_magic (const uint8_t *buf)
 {
@@ -68,7 +67,7 @@ parseElftemplate(32)
 ElfType get_elf_linkage(const char *path)
 {
 	ElfType ret = ELFERROR;
-	attribute_cleanup_fp FILE *elf_file = NULL;
+	FILE *elf_file = NULL;
 	uint8_t pHeader[HEADERSIZE] = "";
 
 	elf_file = fopen(path, "re");
@@ -113,6 +112,7 @@ ElfType get_elf_linkage(const char *path)
 			 */
 			ret = ELFDYNAMIC;
 		}
+		fclose(elf_file);
 	}
 	return ret;
 }
