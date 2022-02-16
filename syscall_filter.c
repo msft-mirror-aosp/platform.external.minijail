@@ -568,6 +568,49 @@ int parse_include_statement(struct parser_state *state, char *policy_line,
 	return 0;
 }
 
+/*
+ * This is like getline() but supports line wrapping with \.
+ */
+static ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream)
+{
+	ssize_t ret = getline(lineptr, n, stream);
+	if (ret < 0)
+		return ret;
+
+	char *line = *lineptr;
+	/* Eat the newline to make processing below easier. */
+	if (ret > 0 && line[ret - 1] == '\n')
+		line[--ret] = '\0';
+
+	/* If the line doesn't end in a backslash, we're done. */
+	if (ret <= 0 || line[ret - 1] != '\\')
+		return ret;
+
+	/* This line ends in a backslash. Get the nextline. */
+	line[--ret] = '\0';
+	size_t next_n = 0;
+	char *next_line = NULL;
+	ssize_t next_ret = getmultiline(&next_line, &next_n, stream);
+	if (next_ret == -1) {
+		free(next_line);
+		/* We couldn't fully read the line, so return an error. */
+		return -1;
+	}
+
+	/* Merge the lines. */
+	*n = ret + next_ret + 2;
+	line = realloc(line, *n);
+	if (!line) {
+		free(next_line);
+		return -1;
+	}
+	line[ret] = ' ';
+	memcpy(&line[ret + 1], next_line, next_ret + 1);
+	free(next_line);
+	*lineptr = line;
+	return *n - 1;
+}
+
 int compile_file(const char *filename, FILE *policy_file,
 		 struct filter_block *head, struct filter_block **arg_blocks,
 		 struct bpf_labels *labels,
@@ -589,7 +632,7 @@ int compile_file(const char *filename, FILE *policy_file,
 	 * Chain the filter sections together and dump them into
 	 * the final buffer at the end.
 	 */
-	attribute_cleanup_str char *line = NULL;
+	char *line = NULL;
 	size_t len = 0;
 	int ret = 0;
 
@@ -624,16 +667,15 @@ int compile_file(const char *filename, FILE *policy_file,
 				    &state,
 				    "failed to parse include statement");
 				ret = -1;
-				goto out;
+				goto free_line;
 			}
 
-			attribute_cleanup_fp FILE *included_file =
-			    fopen(filename, "re");
+			FILE *included_file = fopen(filename, "re");
 			if (included_file == NULL) {
 				compiler_pwarn(&state, "fopen('%s') failed",
 					       filename);
 				ret = -1;
-				goto out;
+				goto free_line;
 			}
 			if (compile_file(filename, included_file, head,
 					 arg_blocks, labels, filteropts,
@@ -641,9 +683,11 @@ int compile_file(const char *filename, FILE *policy_file,
 					 include_level + 1) == -1) {
 				compiler_warn(&state, "'@include %s' failed",
 					      filename);
+				fclose(included_file);
 				ret = -1;
-				goto out;
+				goto free_line;
 			}
+			fclose(included_file);
 			continue;
 		}
 
@@ -656,14 +700,14 @@ int compile_file(const char *filename, FILE *policy_file,
 			warn("compile_file: malformed policy line, missing "
 			     "':'");
 			ret = -1;
-			goto out;
+			goto free_line;
 		}
 
 		policy_line = strip(policy_line);
 		if (*policy_line == '\0') {
 			compiler_warn(&state, "empty policy line");
 			ret = -1;
-			goto out;
+			goto free_line;
 		}
 
 		syscall_name = strip(syscall_name);
@@ -688,7 +732,7 @@ int compile_file(const char *filename, FILE *policy_file,
 				continue;
 			}
 			ret = -1;
-			goto out;
+			goto free_line;
 		}
 
 		if (!insert_and_check_duplicate_syscall(previous_syscalls,
@@ -731,7 +775,7 @@ int compile_file(const char *filename, FILE *policy_file,
 				}
 				warn("could not allocate filter block");
 				ret = -1;
-				goto out;
+				goto free_line;
 			}
 
 			if (*arg_blocks) {
@@ -752,7 +796,8 @@ int compile_file(const char *filename, FILE *policy_file,
 		ret = -1;
 	}
 
-out:
+free_line:
+	free(line);
 	return ret;
 }
 
