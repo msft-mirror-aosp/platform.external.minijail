@@ -35,37 +35,34 @@
  */
 #if defined(__x86_64__)
 #if defined(__ANDROID__)
-const char *const log_syscalls[] = {"socket", "connect", "fcntl", "writev"};
+const char *log_syscalls[] = {"socket", "connect", "fcntl", "writev"};
 #else
-const char *const log_syscalls[] = {"socket", "connect", "sendto", "writev"};
+const char *log_syscalls[] = {"socket", "connect", "sendto", "writev"};
 #endif
 #elif defined(__i386__)
 #if defined(__ANDROID__)
-const char *const log_syscalls[] = {"socketcall", "writev", "fcntl64",
-				    "clock_gettime"};
+const char *log_syscalls[] = {"socketcall", "writev", "fcntl64",
+			      "clock_gettime"};
 #else
-const char *const log_syscalls[] = {"socketcall", "time", "writev"};
+const char *log_syscalls[] = {"socketcall", "time", "writev"};
 #endif
 #elif defined(__arm__)
 #if defined(__ANDROID__)
-const char *const log_syscalls[] = {"clock_gettime", "connect", "fcntl64",
-				    "socket", "writev"};
+const char *log_syscalls[] = {"clock_gettime", "connect", "fcntl64", "socket",
+			      "writev"};
 #else
-const char *const log_syscalls[] = {"socket", "connect", "gettimeofday", "send",
-				    "writev"};
+const char *log_syscalls[] = {"socket", "connect", "gettimeofday", "send",
+			      "writev"};
 #endif
 #elif defined(__aarch64__)
 #if defined(__ANDROID__)
-const char *const log_syscalls[] = {"connect", "fcntl", "sendto", "socket",
-				    "writev"};
+const char *log_syscalls[] = {"connect", "fcntl", "sendto", "socket", "writev"};
 #else
-const char *const log_syscalls[] = {"socket", "connect", "send", "writev"};
+const char *log_syscalls[] = {"socket", "connect", "send", "writev"};
 #endif
 #elif defined(__powerpc__) || defined(__ia64__) || defined(__hppa__) ||        \
-    defined(__sparc__) || defined(__mips__)
-const char *const log_syscalls[] = {"socket", "connect", "send"};
-#elif defined(__riscv)
-const char *const log_syscalls[] = {"socket", "connect", "sendto"};
+      defined(__sparc__) || defined(__mips__)
+const char *log_syscalls[] = {"socket", "connect", "send"};
 #else
 #error "Unsupported platform"
 #endif
@@ -443,10 +440,16 @@ char *tokenize(char **stringp, const char *delim)
 
 char *path_join(const char *external_path, const char *internal_path)
 {
-	char *path = NULL;
-	return asprintf(&path, "%s/%s", external_path, internal_path) < 0
-		   ? NULL
-		   : path;
+	char *path;
+	size_t pathlen;
+
+	/* One extra char for '/' and one for '\0', hence + 2. */
+	pathlen = strlen(external_path) + strlen(internal_path) + 2;
+	path = malloc(pathlen);
+	if (path)
+		snprintf(path, pathlen, "%s/%s", external_path, internal_path);
+
+	return path;
 }
 
 void *consumebytes(size_t length, char **buf, size_t *buflength)
@@ -511,46 +514,24 @@ char **minijail_copy_env(char *const *env)
 	return copy;
 }
 
-/*
- * Utility function used by minijail_setenv, minijail_unsetenv and
- * minijail_getenv, returns true if |name| is found, false if not.
- * If found, |*i| is |name|'s index. If not, |*i| is the length of |envp|.
- */
-static bool getenv_index(char **envp, const char *name, int *i) {
-	if (!envp || !name || !i)
-		return false;
-
-	size_t name_len = strlen(name);
-	for (*i = 0; envp[*i]; ++(*i)) {
-		/*
-		 * If we find a match the size of |name|, we must check
-		 * that the next character is a '=', indicating that
-		 * the full varname of envp[i] is exactly |name| and
-		 * not just happening to start with |name|.
-		 */
-		if (!strncmp(envp[*i], name, name_len) &&
-		    (envp[*i][name_len] == '=')) {
-			return true;
-		}
-	}
-	/* No match found, |*i| contains the number of elements in |envp|. */
-	return false;
-}
-
 int minijail_setenv(char ***env, const char *name, const char *value,
 		    int overwrite)
 {
 	if (!env || !*env || !name || !*name || !value)
 		return EINVAL;
 
-	char **dest = NULL;
-	int i;
+	size_t name_len = strlen(name);
 
-	/* Look in env to check if this var name already exists. */
-	if (getenv_index(*env, name, &i)) {
-		if (!overwrite)
-			return 0;
-		dest = &(*env)[i];
+	char **dest = NULL;
+	size_t env_len = 0;
+	for (char **entry = *env; *entry; ++entry, ++env_len) {
+		if (!dest && strncmp(name, *entry, name_len) == 0 &&
+		    (*entry)[name_len] == '=') {
+			if (!overwrite)
+				return 0;
+
+			dest = entry;
+		}
 	}
 
 	char *new_entry = NULL;
@@ -563,87 +544,15 @@ int minijail_setenv(char ***env, const char *name, const char *value,
 		return 0;
 	}
 
-	/* getenv_index has set |i| to the length of |env|. */
-	++i;
-	char **new_env = realloc(*env, (i + 1) * sizeof(char *));
+	env_len++;
+	char **new_env = realloc(*env, (env_len + 1) * sizeof(char *));
 	if (!new_env) {
 		free(new_entry);
 		return ENOMEM;
 	}
 
-	new_env[i - 1] = new_entry;
-	new_env[i] = NULL;
+	new_env[env_len - 1] = new_entry;
+	new_env[env_len] = NULL;
 	*env = new_env;
 	return 0;
-}
-
-/*
- * This is like getline() but supports line wrapping with \.
- */
-ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream)
-{
-	ssize_t ret = getline(lineptr, n, stream);
-	if (ret < 0)
-		return ret;
-
-	char *line = *lineptr;
-	/* Eat the newline to make processing below easier. */
-	if (ret > 0 && line[ret - 1] == '\n')
-		line[--ret] = '\0';
-
-	/* If the line doesn't end in a backslash, we're done. */
-	if (ret <= 0 || line[ret - 1] != '\\')
-		return ret;
-
-	/* This line ends in a backslash. Get the nextline. */
-	line[--ret] = '\0';
-	size_t next_n = 0;
-	attribute_cleanup_str char *next_line = NULL;
-	ssize_t next_ret = getmultiline(&next_line, &next_n, stream);
-	if (next_ret == -1) {
-		/* We couldn't fully read the line, so return an error. */
-		return -1;
-	}
-
-	/* Merge the lines. */
-	*n = ret + next_ret + 2;
-	line = realloc(line, *n);
-	if (!line)
-		return -1;
-	line[ret] = ' ';
-	memcpy(&line[ret + 1], next_line, next_ret + 1);
-	*lineptr = line;
-	return *n - 1;
-}
-
-char *minijail_getenv(char **envp, const char *name) {
-	if (!envp || !name)
-		return NULL;
-
-	int i;
-	if (!getenv_index(envp, name, &i))
-		return NULL;
-
-	/* Return a ptr to the value after the '='. */
-	return envp[i] + strlen(name) + 1;
-}
-
-bool minijail_unsetenv(char **envp, const char *name)
-{
-	if (!envp || !name)
-		return false;
-
-	int i;
-	if (!getenv_index(envp, name, &i))
-		return false;
-
-	/* We found a match, replace it by the last entry of the array. */
-	int last;
-	for (last = i; envp[last]; ++last)
-		continue;
-	--last;
-	envp[i] = envp[last];
-	envp[last] = NULL;
-
-	return true;
 }

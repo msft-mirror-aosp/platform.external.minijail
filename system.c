@@ -111,8 +111,7 @@ int lock_securebits(uint64_t skip_mask, bool require_keep_caps)
 
 int write_proc_file(pid_t pid, const char *content, const char *basename)
 {
-	attribute_cleanup_fd int fd = -1;
-	int ret;
+	int fd, ret;
 	size_t sz, len;
 	ssize_t written;
 	char filename[32];
@@ -141,6 +140,7 @@ int write_proc_file(pid_t pid, const char *content, const char *basename)
 		warn("failed to write %zu bytes to '%s'", len, filename);
 		return -1;
 	}
+	close(fd);
 	return 0;
 }
 
@@ -167,10 +167,8 @@ unsigned int get_last_valid_cap(void)
 			last_valid_cap--;
 		}
 	} else {
-		static const char cap_file[] = "/proc/sys/kernel/cap_last_cap";
+		const char cap_file[] = "/proc/sys/kernel/cap_last_cap";
 		FILE *fp = fopen(cap_file, "re");
-		if (!fp)
-			pdie("fopen(%s)", cap_file);
 		if (fscanf(fp, "%u", &last_valid_cap) != 1)
 			pdie("fscanf(%s)", cap_file);
 		fclose(fp);
@@ -187,7 +185,7 @@ int cap_ambient_supported(void)
 int config_net_loopback(void)
 {
 	const char ifname[] = "lo";
-	attribute_cleanup_fd int sock = -1;
+	int sock;
 	struct ifreq ifr;
 
 	/* Make sure people don't try to add really long names. */
@@ -216,6 +214,7 @@ int config_net_loopback(void)
 		return -1;
 	}
 
+	close(sock);
 	return 0;
 }
 
@@ -230,7 +229,6 @@ int write_pid_to_path(pid_t pid, const char *path)
 	if (fprintf(fp, "%d\n", (int)pid) < 0) {
 		/* fprintf(3) does not set errno on failure. */
 		warn("fprintf(%s) failed", path);
-		fclose(fp);
 		return -1;
 	}
 	if (fclose(fp)) {
@@ -367,13 +365,13 @@ int setup_mount_destination(const char *source, const char *dest, uid_t uid,
 	if (rc)
 		return rc;
 	if (!domkdir) {
-		attribute_cleanup_fd int fd = open(
-			dest, O_RDWR | O_CREAT | O_CLOEXEC, 0700);
+		int fd = open(dest, O_RDWR | O_CREAT | O_CLOEXEC, 0700);
 		if (fd < 0) {
 			rc = errno;
 			pwarn("open(%s) failed", dest);
 			return -rc;
 		}
+		close(fd);
 	}
 	if (chown(dest, uid, gid)) {
 		rc = errno;
@@ -500,10 +498,11 @@ static bool seccomp_action_is_available(const char *wanted)
 		return false;
 	}
 
-	attribute_cleanup_str char *actions_avail = NULL;
+	char *actions_avail = NULL;
 	size_t buf_size = 0;
 	if (getline(&actions_avail, &buf_size, f) < 0) {
 		pwarn("getline() failed");
+		free(actions_avail);
 		return false;
 	}
 
@@ -513,7 +512,9 @@ static bool seccomp_action_is_available(const char *wanted)
 	 * seccomp actions which include other actions though, so we're good for
 	 * now. Eventually we might want to split the string by spaces.
 	 */
-	return strstr(actions_avail, wanted) != NULL;
+	bool available = strstr(actions_avail, wanted) != NULL;
+	free(actions_avail);
+	return available;
 }
 
 int seccomp_ret_log_available(void)
