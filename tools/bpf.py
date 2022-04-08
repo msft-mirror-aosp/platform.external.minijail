@@ -69,7 +69,6 @@ SECCOMP_RET_KILL_THREAD = 0x00000000
 SECCOMP_RET_TRAP = 0x00030000
 SECCOMP_RET_ERRNO = 0x00050000
 SECCOMP_RET_TRACE = 0x7ff00000
-SECCOMP_RET_USER_NOTIF = 0x7fc00000
 SECCOMP_RET_LOG = 0x7ffc0000
 SECCOMP_RET_ALLOW = 0x7fff0000
 
@@ -133,8 +132,6 @@ def simulate(instructions, arch, syscall_number, *args):
                 return (cost, 'ERRNO', ins.k & SECCOMP_RET_DATA)
             if ins.k == SECCOMP_RET_TRACE:
                 return (cost, 'TRACE')
-            if ins.k == SECCOMP_RET_USER_NOTIF:
-                return (cost, 'USER_NOTIF')
             if ins.k == SECCOMP_RET_LOG:
                 return (cost, 'LOG')
             if ins.k == SECCOMP_RET_ALLOW:
@@ -221,13 +218,6 @@ class Trace(BasicBlock):
 
     def __init__(self):
         super().__init__([SockFilter(BPF_RET, 0x00, 0x00, SECCOMP_RET_TRACE)])
-
-
-class UserNotify(BasicBlock):
-    """A BasicBlock that unconditionally returns USER_NOTIF."""
-
-    def __init__(self):
-        super().__init__([SockFilter(BPF_RET, 0x00, 0x00, SECCOMP_RET_USER_NOTIF)])
 
 
 class Log(BasicBlock):
@@ -396,8 +386,6 @@ class AbstractVisitor(abc.ABC):
             self.visitReturnErrno(block)
         elif isinstance(block, Trace):
             self.visitTrace(block)
-        elif isinstance(block, UserNotify):
-            self.visitUserNotify(block)
         elif isinstance(block, Log):
             self.visitLog(block)
         elif isinstance(block, Allow):
@@ -433,10 +421,6 @@ class AbstractVisitor(abc.ABC):
 
     @abc.abstractmethod
     def visitTrace(self, block):
-        pass
-
-    @abc.abstractmethod
-    def visitUserNotify(self, block):
         pass
 
     @abc.abstractmethod
@@ -499,10 +483,6 @@ class CopyingVisitor(AbstractVisitor):
     def visitTrace(self, block):
         assert id(block) not in self._mapping
         self._mapping[id(block)] = Trace()
-
-    def visitUserNotify(self, block):
-        assert id(block) not in self._mapping
-        self._mapping[id(block)] = UserNotify()
 
     def visitLog(self, block):
         assert id(block) not in self._mapping
@@ -707,7 +687,7 @@ class ArgFilterForwardingVisitor:
         # want to visit them just yet.
         if (isinstance(block, KillProcess) or isinstance(block, KillThread)
                 or isinstance(block, Trap) or isinstance(block, ReturnErrno)
-                or isinstance(block, Trace) or isinstance(block, UserNotify)
-                or isinstance(block, Log) or isinstance(block, Allow)):
+                or isinstance(block, Trace) or isinstance(block, Log)
+                or isinstance(block, Allow)):
             return
         block.accept(self.visitor)

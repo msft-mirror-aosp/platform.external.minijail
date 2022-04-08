@@ -236,11 +236,6 @@ size_t bpf_arg_comp(struct sock_filter **pfilter, int op, int argidx,
 				unsigned char jt, unsigned char jf);
 	int flip = 0;
 
-	if (!filter) {
-		*pfilter = NULL;
-		return 0;
-	}
-
 	/* Load arg */
 	curr_block += bpf_load_arg(curr_block, argidx);
 

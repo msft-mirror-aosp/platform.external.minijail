@@ -352,10 +352,6 @@ class ParseFilterTests(unittest.TestCase):
                 parser.Filter(None, bpf.Trace()),
             ])
         self.assertEqual(
-            self.parser.parse_filter(self._tokenize('user-notify')), [
-                parser.Filter(None, bpf.UserNotify()),
-            ])
-        self.assertEqual(
             self.parser.parse_filter(self._tokenize('log')), [
                 parser.Filter(None, bpf.Log()),
             ])
