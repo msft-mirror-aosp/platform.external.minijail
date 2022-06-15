@@ -62,7 +62,6 @@ libminijailSrcFiles = [
 
 unittestSrcFiles = [
     "testrunner.cc",
-    "test_util.cc",
 ]
 
 minijailCommonLibraries = ["libcap"]
@@ -92,6 +91,7 @@ cc_object {
     vendor_available: true,
     product_available: true,
     recovery_available: true,
+    header_libs: ["libc_headers"], // TODO(b/153662223): Clean this up.
     srcs: ["gen_syscalls.c"],
     cflags: [
         "-dD",
@@ -102,7 +102,6 @@ cc_object {
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
-        "com.android.compos",
         "com.android.media.swcodec",
         "com.android.virt",
     ],
@@ -121,7 +120,6 @@ cc_genrule {
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
-        "com.android.compos",
         "com.android.media.swcodec",
         "com.android.virt",
     ],
@@ -132,6 +130,7 @@ cc_object {
     vendor_available: true,
     product_available: true,
     recovery_available: true,
+    header_libs: ["libc_headers"], // TODO(b/153662223): Clean this up.
     srcs: ["gen_constants.c"],
     cflags: [
         "-dD",
@@ -142,7 +141,6 @@ cc_object {
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
-        "com.android.compos",
         "com.android.media.swcodec",
         "com.android.virt",
     ],
@@ -161,7 +159,6 @@ cc_genrule {
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
-        "com.android.compos",
         "com.android.media.swcodec",
         "com.android.virt",
     ],
@@ -192,7 +189,6 @@ cc_library_static {
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
-        "com.android.compos",
         "com.android.media.swcodec",
         "com.android.virt",
     ],
@@ -205,6 +201,7 @@ cc_object {
     product_available: true,
     recovery_available: true,
     host_supported: true,
+    header_libs: ["libc_headers"], // TODO(b/153662223): Clean this up.
     cflags: [
         "-S",
         "-O0",
@@ -227,6 +224,7 @@ cc_object {
     product_available: true,
     recovery_available: true,
     host_supported: true,
+    header_libs: ["libc_headers"], // TODO(b/153662223): Clean this up.
     cflags: [
         "-S",
         "-O0",
@@ -279,7 +277,6 @@ cc_library {
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
-        "com.android.compos",
         "com.android.media.swcodec",
         "com.android.virt",
     ],
@@ -444,7 +441,6 @@ cc_test {
         "-DPRELOADPATH=\"/invalid\"",
     ],
     srcs: libminijailSrcFiles + [
-        "config_parser.c",
         "elfparse.c",
         "minijail0_cli.c",
         "minijail0_cli_unittest.cc",
@@ -458,41 +454,6 @@ cc_test {
             test_suites: ["device-tests"],
         },
     },
-    data: ["test/*"],
-}
-
-
-// Configuration file parser functionality unit tests using gtest.
-//
-// For a device, run with:
-// adb shell /data/nativetest/config_parser_unittest_gtest/config_parser_unittest_gtest
-//
-// For host, run with:
-// out/host/linux-x86/nativetest(64)/config_parser_unittest_gtest/config_parser_unittest_gtest
-// =========================================================
-cc_test {
-    name: "config_parser_unittest_gtest",
-    defaults: ["libminijail_flags"],
-    host_supported: true,
-
-    srcs: [
-        "config_parser.c",
-        "util.c",
-        "config_parser_unittest.cc",
-    ] + unittestSrcFiles,
-
-    static_libs: ["libminijail_generated"],
-    shared_libs: minijailCommonLibraries,
-
-    target: {
-        android: {
-            test_suites: ["device-tests"],
-        },
-    },
-    test_options: {
-        unit_test: true,
-    },
-    data: ["test/*"],
 }
 
 // libminijail_test executable for brillo_Minijail test.
@@ -541,7 +502,6 @@ cc_binary {
         "-DPRELOADPATH=\"/invalidminijailpreload.so\"",
     ],
     srcs: [
-        "config_parser.c",
         "elfparse.c",
         "minijail0.c",
         "minijail0_cli.c",
@@ -578,7 +538,6 @@ rust_library {
     ],
     apex_available: [
         "//apex_available:platform",
-        "com.android.compos",
         "com.android.virt",
     ],
 }
@@ -598,7 +557,6 @@ rust_library {
     ],
     apex_available: [
         "//apex_available:platform",
-        "com.android.compos",
         "com.android.virt",
     ],
 }
