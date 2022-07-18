@@ -26,6 +26,7 @@
 #include "libminijail-private.h"
 #include "libminijail.h"
 #include "scoped_minijail.h"
+#include "unittest_util.h"
 #include "util.h"
 
 namespace {
@@ -938,7 +939,7 @@ TEST(Test, test_minijail_preserve_fd) {
   status = read(read_pipe[0], buf, 8);
   EXPECT_EQ(status, (int)teststr_len);
   buf[teststr_len] = 0;
-  EXPECT_EQ(strcmp(buf, teststr), 0);
+  EXPECT_STREQ(buf, teststr);
 
   status = minijail_wait(j);
   EXPECT_EQ(status, 0);
@@ -1004,6 +1005,35 @@ TEST(Test, test_minijail_reset_signal_handlers) {
   EXPECT_EQ(WEXITSTATUS(status), 0);
 
   minijail_destroy(j);
+}
+
+// Test that bind mounting with a symlink works (but we're about to make this
+// fail).
+TEST(Test, test_bind_mount_symlink) {
+  TemporaryDir dir;
+  ASSERT_TRUE(dir.is_valid());
+
+  // minijail_bind() expects absolute paths, but TemporaryDir::path can return
+  // relative paths on Linux.
+  std::string path = dir.path;
+  if (!is_android()) {
+    std::string cwd(getcwd(NULL, 0));
+    path = cwd + "/" + path;
+  }
+
+  std::string path_src = path + "/src";
+  std::string path_dest = path + "/dest";
+  std::string path_sym = path + "/symlink";
+
+  EXPECT_EQ(mkdir(path_src.c_str(), 0700), 0);
+  EXPECT_EQ(mkdir(path_dest.c_str(), 0700), 0);
+  EXPECT_EQ(symlink(path_src.c_str(), path_sym.c_str()), 0);
+
+  ScopedMinijail j(minijail_new());
+  int bind_res = minijail_bind(j.get(), path_sym.c_str(), path_dest.c_str(),
+                               0 /*writable*/);
+  EXPECT_EQ(bind_res, 0);
+  EXPECT_EQ(unlink(path_sym.c_str()), 0);
 }
 
 namespace {
@@ -1155,7 +1185,7 @@ TEST_F(NamespaceTest, test_namespaces) {
       ssize_t read_ret = read(child_stdout, buf, 8);
       EXPECT_EQ(read_ret, static_cast<ssize_t>(teststr_len));
       buf[teststr_len] = 0;
-      EXPECT_EQ(strcmp(buf, teststr), 0);
+      EXPECT_STREQ(buf, teststr);
 
       // Grab the set of namespaces in every container process. They must not
       // match the ones in the init namespace, and they must all match each
@@ -1389,6 +1419,45 @@ TEST_F(NamespaceTest, test_remount_one_shared) {
   EXPECT_GE(read_ret, 0);
   buf[read_ret] = '\0';
   EXPECT_NE(std::string(buf).find("/proc"), std::string::npos);
+
+  status = minijail_wait(j);
+  EXPECT_EQ(status, 0);
+
+  minijail_destroy(j);
+}
+
+// Test that using minijail_mount() for bind mounts works.
+TEST_F(NamespaceTest, test_remount_ro_using_mount) {
+  int status;
+  char uidmap[kBufferSize], gidmap[kBufferSize];
+  constexpr uid_t kTargetUid = 1000;  // Any non-zero value will do.
+  constexpr gid_t kTargetGid = 1000;
+
+  if (!userns_supported_)
+    GTEST_SKIP();
+
+  struct minijail *j = minijail_new();
+
+  minijail_namespace_pids(j);
+  minijail_namespace_vfs(j);
+  minijail_mount_tmp(j);
+  minijail_run_as_init(j);
+
+  // Perform userns mapping.
+  minijail_namespace_user(j);
+  snprintf(uidmap, sizeof(uidmap), "%d %d 1", kTargetUid, getuid());
+  snprintf(gidmap, sizeof(gidmap), "%d %d 1", kTargetGid, getgid());
+  minijail_change_uid(j, kTargetUid);
+  minijail_change_gid(j, kTargetGid);
+  minijail_uidmap(j, uidmap);
+  minijail_gidmap(j, gidmap);
+  minijail_namespace_user_disable_setgroups(j);
+
+  // Perform a RO remount using minijail_mount().
+  minijail_mount(j, "none", "/", "none", MS_REMOUNT | MS_BIND | MS_RDONLY);
+
+  char *argv[] = {"/bin/true", nullptr};
+  minijail_run_no_preload(j, argv[0], argv);
 
   status = minijail_wait(j);
   EXPECT_EQ(status, 0);
