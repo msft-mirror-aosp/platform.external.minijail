@@ -873,6 +873,42 @@ int API minijail_add_fs_restriction_advanced_rw(struct minijail *j,
 		ACCESS_FS_ROUGHLY_READ | ACCESS_FS_ROUGHLY_FULL_WRITE);
 }
 
+static bool is_valid_bind_path(const char *path)
+{
+	if (!block_symlinks_in_bindmount_paths()) {
+		return true;
+	}
+
+	/*
+	 * tokenize() will modify both the |prefixes| pointer and the contents
+	 * of the string, so:
+	 * -Copy |BINDMOUNT_ALLOWED_PREFIXES| since it lives in .rodata.
+	 * -Save the original pointer for free()ing.
+	 */
+	char *prefixes = strdup(BINDMOUNT_ALLOWED_PREFIXES);
+	attribute_cleanup_str char *orig_prefixes = prefixes;
+	(void)orig_prefixes;
+
+	char *prefix = NULL;
+	bool found_prefix = false;
+	if (!is_canonical_path(path)) {
+		while ((prefix = tokenize(&prefixes, ",")) != NULL) {
+			if (path_is_parent(prefix, path)) {
+				found_prefix = true;
+				break;
+			}
+		}
+		if (!found_prefix) {
+			/*
+			 * If the path does not include one of the allowed
+			 * prefixes, fail.
+			 */
+			warn("path '%s' is not a canonical path", path);
+			return false;
+		}
+	}
+	return true;
+}
 
 int API minijail_mount_with_data(struct minijail *j, const char *src,
 				 const char *dest, const char *type,
@@ -956,6 +992,13 @@ int API minijail_bind(struct minijail *j, const char *src, const char *dest,
 		      int writeable)
 {
 	unsigned long flags = MS_BIND;
+
+	if (!is_valid_bind_path(src)) {
+		warn("src '%s' is not a valid bind mount path", src);
+		return -ELOOP;
+	}
+
+	/* |dest| might not yet exist. */
 
 	if (!writeable)
 		flags |= MS_RDONLY;
@@ -2256,6 +2299,15 @@ static void drop_caps(const struct minijail *j, unsigned int last_valid_cap)
 	cap_free(caps);
 }
 
+static void apply_landlock_restrictions(const struct minijail *j)
+{
+	if (j->landlock_used && j->ruleset_fd >= 0) {
+		if (landlock_restrict_self(j->ruleset_fd, 0)) {
+			pdie("Failed to enforce ruleset");
+		}
+	}
+}
+
 static void set_seccomp_filter(const struct minijail *j)
 {
 	/*
@@ -2549,8 +2601,14 @@ void API minijail_enter(const struct minijail *j)
 		 */
 		drop_ugid(j);
 		drop_caps(j, last_valid_cap);
+
+		// Landlock is applied as late as possible. If no_new_privs is
+		// set, then it can be applied after dropping caps.
+		apply_landlock_restrictions(j);
 		set_seccomp_filter(j);
 	} else {
+		apply_landlock_restrictions(j);
+
 		/*
 		 * If we're not setting no_new_privs,
 		 * we need to set seccomp filter *before* dropping privileges.
@@ -3584,16 +3642,6 @@ static int minijail_run_internal(struct minijail *j,
 	if (!config->exec_in_child)
 		return 0;
 
-	/*
-	 * Apply Landlock restrictions if enabled. Restrictions are applied after
-	 * forking and before execve, because this helps prevent interfering with
-	 * other minijail system calls.
-	 */
-	if (j->landlock_used && j->ruleset_fd >= 0) {
-		if (landlock_restrict_self(j->ruleset_fd, 0)) {
-			pdie("Failed to enforce ruleset");
-		}
-	}
 	if (j->ruleset_fd >= 0) {
 		close(j->ruleset_fd);
 		j->ruleset_fd = -1;
