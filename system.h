@@ -51,8 +51,10 @@ int write_proc_file(pid_t pid, const char *content, const char *basename);
 
 int mkdir_p(const char *path, mode_t mode, bool isdir);
 
+int get_mount_flags(const char *source, unsigned long *mnt_flags);
+
 int setup_mount_destination(const char *source, const char *dest, uid_t uid,
-			    uid_t gid, bool bind, unsigned long *mnt_flags);
+			    uid_t gid, bool bind);
 
 int lookup_user(const char *user, uid_t *uid, gid_t *gid);
 int lookup_group(const char *group, gid_t *gid);
@@ -60,6 +62,15 @@ int lookup_group(const char *group, gid_t *gid);
 int seccomp_ret_log_available(void);
 int seccomp_ret_kill_process_available(void);
 bool seccomp_filter_flags_available(unsigned int flags);
+
+/*
+ * is_canonical_path: checks whether @path is a canonical path.
+ * This means:
+ * -Absolute.
+ * -No symlinks.
+ * -No /./, /../, or extra '/'.
+ */
+bool is_canonical_path(const char *path);
 
 #ifdef __cplusplus
 }; /* extern "C" */
