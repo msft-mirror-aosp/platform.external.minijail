@@ -1,4 +1,4 @@
-/* Copyright 2017 The Chromium OS Authors. All rights reserved.
+/* Copyright 2017 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -69,6 +69,7 @@ bool seccomp_filter_flags_available(unsigned int flags);
  * -Absolute.
  * -No symlinks.
  * -No /./, /../, or extra '/'.
+ * -Single trailing '/' is OK.
  */
 bool is_canonical_path(const char *path);
 

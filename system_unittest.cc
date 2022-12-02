@@ -1,4 +1,4 @@
-/* Copyright 2017 The Chromium OS Authors. All rights reserved.
+/* Copyright 2017 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  *
@@ -257,4 +257,9 @@ TEST(is_canonical_path, basic) {
   EXPECT_TRUE(is_canonical_path("/"));
   EXPECT_TRUE(is_canonical_path("/proc"));
   EXPECT_TRUE(is_canonical_path("/proc/1"));
+}
+
+TEST(is_canonical_path, trailing_slash) {
+  EXPECT_TRUE(is_canonical_path("/proc/1/"));
+  EXPECT_FALSE(is_canonical_path("/proc/1//"));
 }
