@@ -1,4 +1,4 @@
-/* Copyright 2018 The Chromium OS Authors. All rights reserved.
+/* Copyright 2018 The ChromiumOS Authors
  * Use of this source code is governed by a BSD-style license that can be
  * found in the LICENSE file.
  */
@@ -403,6 +403,7 @@ static void use_profile(struct minijail *j, const char *profile,
 			*tmp_size = DEFAULT_TMP_SIZE;
 		}
 		minijail_remount_proc_readonly(j);
+		minijail_set_using_minimalistic_mountns(j);
 		use_pivot_root(j, DEFAULT_PIVOT_ROOT, pivot_root, chroot);
 	} else
 		errx(1, "Unrecognized profile name '%s'", profile);
@@ -467,6 +468,11 @@ enum {
 	OPT_CONFIG,
 	OPT_ENV_ADD,
 	OPT_ENV_RESET,
+	OPT_FS_DEFAULT_PATHS,
+	OPT_FS_PATH_RX,
+	OPT_FS_PATH_RO,
+	OPT_FS_PATH_RW,
+	OPT_FS_PATH_ADVANCED_RW,
 	OPT_LOGGING,
 	OPT_PRELOAD_LIBRARY,
 	OPT_PROFILE,
@@ -501,6 +507,11 @@ static const struct option long_options[] = {
     {"mount", required_argument, 0, 'k'},
     {"bind-mount", required_argument, 0, 'b'},
     {"ns-mount", no_argument, 0, 'v'},
+    {"fs-default-paths", no_argument, 0, OPT_FS_DEFAULT_PATHS},
+    {"fs-path-rx", required_argument, 0, OPT_FS_PATH_RX},
+    {"fs-path-ro", required_argument, 0, OPT_FS_PATH_RO},
+    {"fs-path-rw", required_argument, 0, OPT_FS_PATH_RW},
+    {"fs-path-advanced-rw", required_argument, 0, OPT_FS_PATH_ADVANCED_RW},
     {0, 0, 0, 0},
 };
 
@@ -615,6 +626,17 @@ static const char help_text[] =
 "Uncommon options:\n"
 "  --allow-speculative-execution\n"
 "               Allow speculative execution by disabling mitigations.\n"
+"  --fs-default-paths\n"
+"               Adds a set of allowed paths to allow running common system \n"
+"               executables.\n"
+"  --fs-path-rx\n"
+"               Adds an allowed read-execute path.\n"
+"  --fs-path-ro\n"
+"               Adds an allowed read-only path.\n"
+"  --fs-path-rw\n"
+"               Adds an allowed read-write path.\n"
+"  --fs-path-advanced-rw\n"
+"               Adds an allowed advanced read-write path.\n"
 "  --preload-library=<file>\n"
 "               Overrides the path to \"" PRELOADPATH "\".\n"
 "               This is only really useful for local testing.\n"
@@ -1001,6 +1023,21 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			break;
 		case OPT_PRELOAD_LIBRARY:
 			*preload_path = optarg;
+			break;
+		case OPT_FS_DEFAULT_PATHS:
+			minijail_enable_default_fs_restrictions(j);
+			break;
+		case OPT_FS_PATH_RX:
+			minijail_add_fs_restriction_rx(j, optarg);
+			break;
+		case OPT_FS_PATH_RO:
+			minijail_add_fs_restriction_ro(j, optarg);
+			break;
+		case OPT_FS_PATH_RW:
+			minijail_add_fs_restriction_rw(j, optarg);
+			break;
+		case OPT_FS_PATH_ADVANCED_RW:
+			minijail_add_fs_restriction_advanced_rw(j, optarg);
 			break;
 		case OPT_SECCOMP_BPF_BINARY:
 			if (seccomp != None && seccomp != BpfBinaryFilter) {

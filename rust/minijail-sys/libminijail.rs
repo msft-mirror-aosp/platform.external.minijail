@@ -97,6 +97,15 @@ extern "C" {
     pub fn minijail_set_seccomp_filter_tsync(j: *mut minijail);
 }
 extern "C" {
+    pub fn minijail_set_using_minimalistic_mountns(j: *mut minijail);
+}
+extern "C" {
+    pub fn minijail_add_minimalistic_mountns_fs_rules(j: *mut minijail);
+}
+extern "C" {
+    pub fn minijail_enable_default_fs_restrictions(j: *mut minijail);
+}
+extern "C" {
     pub fn minijail_set_seccomp_filter_allow_speculation(j: *mut minijail);
 }
 extern "C" {
@@ -223,6 +232,36 @@ extern "C" {
 }
 extern "C" {
     pub fn minijail_add_to_cgroup(
+        j: *mut minijail,
+        path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn minijail_add_fs_restriction_rx(
+        j: *mut minijail,
+        path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn minijail_add_fs_restriction_ro(
+        j: *mut minijail,
+        path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn minijail_add_fs_restriction_rw(
+        j: *mut minijail,
+        path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn minijail_add_fs_restriction_advanced_rw(
+        j: *mut minijail,
+        path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn minijail_add_fs_restriction_edit(
         j: *mut minijail,
         path: *const ::std::os::raw::c_char,
     ) -> ::std::os::raw::c_int;
