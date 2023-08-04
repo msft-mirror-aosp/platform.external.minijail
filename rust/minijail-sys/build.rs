@@ -94,7 +94,6 @@ fn bindings_generation() -> io::Result<()> {
         .args(&["--blocklist-type", "__uint64_t"])
         .args(&["--allowlist-function", "^minijail_.*"])
         .args(&["--allowlist-var", "^MINIJAIL_.*"])
-        .arg("--size_t-is-usize")
         .arg("--no-layout-tests")
         .arg("--disable-header-comment")
         .args(&["--output", gen_file.to_str().unwrap()])
