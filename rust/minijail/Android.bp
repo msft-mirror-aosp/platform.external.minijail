@@ -30,4 +30,5 @@ rust_library {
         "com.android.compos",
         "com.android.virt",
     ],
+    vendor_available: true,
 }
