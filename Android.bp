@@ -253,9 +253,6 @@ cc_library {
     vendor_available: true,
     product_available: true,
     recovery_available: true,
-    vndk: {
-        enabled: true,
-    },
 
     defaults: ["libminijail_flags"],
 
