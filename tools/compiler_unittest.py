@@ -23,15 +23,16 @@ import random
 import shutil
 import tempfile
 import unittest
+from importlib import resources
 
 import arch
 import bpf
 import compiler
 import parser  # pylint: disable=wrong-import-order
 
-ARCH_64 = arch.Arch.load_from_json(
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'testdata/arch_64.json'))
+ARCH_64 = arch.Arch.load_from_json_bytes(
+    resources.files("testdata").joinpath("arch_64.json").read_bytes()
+)
 
 
 class CompileFilterStatementTests(unittest.TestCase):
@@ -404,7 +405,8 @@ class CompileFileTests(unittest.TestCase):
             num_entries = 64 * (i + 1) // iterations
             syscalls = dict(
                 zip(
-                    random.sample(self.arch.syscalls.keys(), num_entries),
+                    random.sample(
+                        list(self.arch.syscalls.keys()), num_entries),
                     (random.randint(1, 1024) for _ in range(num_entries)),
                 ))
 
@@ -479,7 +481,8 @@ class CompileFileTests(unittest.TestCase):
         # codegen layer will coalesce filters that compile to the same
         # instructions.
         policy_contents = []
-        for name in random.sample(self.arch.syscalls.keys(), num_entries):
+        for name in random.sample(
+            list(self.arch.syscalls.keys()), num_entries):
             values = random.sample(range(1024), num_entries)
             syscalls[name] = values
             policy_contents.append(
