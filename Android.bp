@@ -99,6 +99,7 @@ cc_object {
         "-E",
         "-Wall",
         "-Werror",
+        "-Wno-unused-command-line-argument",
     ],
     apex_available: [
         "//apex_available:platform",
@@ -139,6 +140,7 @@ cc_object {
         "-E",
         "-Wall",
         "-Werror",
+        "-Wno-unused-command-line-argument",
     ],
     apex_available: [
         "//apex_available:platform",
@@ -210,6 +212,7 @@ cc_object {
         "-S",
         "-O0",
         "-emit-llvm",
+        "-Wno-unused-command-line-argument",
     ],
 
     target: {
@@ -232,6 +235,7 @@ cc_object {
         "-S",
         "-O0",
         "-emit-llvm",
+        "-Wno-unused-command-line-argument",
     ],
 
     target: {
