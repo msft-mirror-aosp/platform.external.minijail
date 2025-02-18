@@ -111,3 +111,7 @@
 #define __NR_membarrier 283
 #endif
 #endif /* __NR_membarrier */
+
+#ifndef __NR_mseal
+#define __NR_mseal 462
+#endif /* __NR_mseal */

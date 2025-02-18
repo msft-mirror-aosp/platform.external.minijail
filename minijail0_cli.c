@@ -3,6 +3,7 @@
  * found in the LICENSE file.
  */
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <err.h>
 #include <errno.h>
@@ -31,8 +32,15 @@
 #include "system.h"
 #include "util.h"
 
-#define IDMAP_LEN 32U
+#define IDMAP_LEN	 32U
 #define DEFAULT_TMP_SIZE (64 * 1024 * 1024)
+
+/* option_entry struct: tracks configuration options. */
+struct option_entry {
+	char *name;
+	char *args;
+	struct option_entry *next;
+};
 
 /*
  * A malloc() that aborts on failure.  We only implement this in the CLI as
@@ -124,7 +132,7 @@ static void suppl_group_add(size_t *suppl_gids_count, gid_t **suppl_gids,
 	 */
 	*suppl_gids =
 	    realloc(*suppl_gids, sizeof(gid_t) * ++(*suppl_gids_count));
-	if (!suppl_gids)
+	if (!*suppl_gids)
 		err(1, "failed to allocate memory");
 
 	(*suppl_gids)[*suppl_gids_count - 1] = gid;
@@ -313,8 +321,8 @@ static int has_cap_setgid(void)
 	return cap_value == CAP_SET;
 }
 
-static void set_ugid_mapping(struct minijail *j, int set_uidmap, uid_t uid,
-			     char *uidmap, int set_gidmap, gid_t gid,
+static void set_ugid_mapping(struct minijail *j, bool set_uidmap, uid_t uid,
+			     char *uidmap, bool set_gidmap, gid_t gid,
 			     char *gidmap)
 {
 	if (set_uidmap) {
@@ -360,29 +368,29 @@ static void set_ugid_mapping(struct minijail *j, int set_uidmap, uid_t uid,
 	}
 }
 
-static void use_chroot(struct minijail *j, const char *path, int *chroot,
-		       int pivot_root)
+static void use_chroot(struct minijail *j, const char *path, bool *chroot,
+		       bool pivot_root)
 {
 	if (pivot_root)
 		errx(1, "Could not set chroot because -P was specified");
 	if (minijail_enter_chroot(j, path))
 		errx(1, "Could not set chroot");
-	*chroot = 1;
+	*chroot = true;
 }
 
 static void use_pivot_root(struct minijail *j, const char *path,
-			   int *pivot_root, int chroot)
+			   bool *pivot_root, bool chroot)
 {
 	if (chroot)
 		errx(1, "Could not set pivot_root because -C was specified");
 	if (minijail_enter_pivot_root(j, path))
 		errx(1, "Could not set pivot_root");
 	minijail_namespace_vfs(j);
-	*pivot_root = 1;
+	*pivot_root = true;
 }
 
 static void use_profile(struct minijail *j, const char *profile,
-			int *pivot_root, int chroot, size_t *tmp_size)
+			bool *pivot_root, bool chroot, size_t *tmp_size)
 {
 	/* Note: New profiles should be added in minijail0_cli_unittest.cc. */
 
@@ -450,6 +458,20 @@ static void read_seccomp_filter(const char *filter_path,
 	}
 }
 
+static void set_seccomp_filters(struct minijail *j, const char *filter_path)
+{
+	struct sock_fprog filter;
+	read_seccomp_filter(filter_path, &filter);
+	minijail_set_seccomp_filters(j, &filter);
+	free((void *)filter.filter);
+}
+
+/* Path for v0 of default runtime environment. */
+static const char default_policy_path[] = "/etc/security/minijail/v0.bin";
+
+static const char config_flag_name[] = "config";
+static const char gen_config_flag_name[] = "gen-config";
+
 /*
  * Long options use values starting at 0x100 so that they're out of range of
  * bytes which is how command line options are processed.  Practically speaking,
@@ -468,13 +490,19 @@ enum {
 	OPT_CONFIG,
 	OPT_ENV_ADD,
 	OPT_ENV_RESET,
+	OPT_ENABLE_PROFILE_FS_RESTRICTIONS,
 	OPT_FS_DEFAULT_PATHS,
 	OPT_FS_PATH_RX,
 	OPT_FS_PATH_RO,
 	OPT_FS_PATH_RW,
 	OPT_FS_PATH_ADVANCED_RW,
+	OPT_GEN_CONFIG,
 	OPT_LOGGING,
+	OPT_NO_DEFAULT_RUNTIME,
+	OPT_NO_FS_RESTRICTIONS,
+	OPT_NO_NEW_SESSIONS,
 	OPT_PRELOAD_LIBRARY,
+	OPT_PRESERVE_FD,
 	OPT_PROFILE,
 	OPT_SECCOMP_BPF_BINARY,
 	OPT_UTS,
@@ -501,17 +529,24 @@ static const struct option long_options[] = {
     {"add-suppl-group", required_argument, 0, OPT_ADD_SUPPL_GROUP},
     {"allow-speculative-execution", no_argument, 0,
      OPT_ALLOW_SPECULATIVE_EXECUTION},
-    {"config", required_argument, 0, OPT_CONFIG},
+    {config_flag_name, required_argument, 0, OPT_CONFIG},
+    {gen_config_flag_name, required_argument, 0, OPT_GEN_CONFIG},
     {"env-add", required_argument, 0, OPT_ENV_ADD},
     {"env-reset", no_argument, 0, OPT_ENV_RESET},
     {"mount", required_argument, 0, 'k'},
     {"bind-mount", required_argument, 0, 'b'},
     {"ns-mount", no_argument, 0, 'v'},
+    {"enable-profile-fs-restrictions", no_argument, 0,
+     OPT_ENABLE_PROFILE_FS_RESTRICTIONS},
     {"fs-default-paths", no_argument, 0, OPT_FS_DEFAULT_PATHS},
     {"fs-path-rx", required_argument, 0, OPT_FS_PATH_RX},
     {"fs-path-ro", required_argument, 0, OPT_FS_PATH_RO},
     {"fs-path-rw", required_argument, 0, OPT_FS_PATH_RW},
     {"fs-path-advanced-rw", required_argument, 0, OPT_FS_PATH_ADVANCED_RW},
+    {"no-default-runtime-environment", no_argument, 0, OPT_NO_DEFAULT_RUNTIME},
+    {"no-fs-restrictions", no_argument, 0, OPT_NO_FS_RESTRICTIONS},
+    {"no-new-sessions", no_argument, 0, OPT_NO_NEW_SESSIONS},
+    {"preserve-fd", required_argument, 0, OPT_PRESERVE_FD},
     {0, 0, 0, 0},
 };
 
@@ -595,6 +630,14 @@ static const char help_text[] =
 "  --config <file>\n"
 "               Load the Minijail configuration file <file>.\n"
 "               If used, must be specified ahead of other options.\n"
+"  --gen-config <file>\n"
+"               Convert the current flags to a config file, then exit.\n"
+"               Only flags impacting the jailed process are included \n"
+"               (this flag, --config, and help messages are not).\n"
+"               This should be set first to avoid evaluating other flags, \n"
+"               or set later to evaluate users and paths currently available\n"
+"               (example: checking if -u is a valid user).\n"
+"               Path must be specified.\n"
 "  --profile <p>\n"
 "               Configure minijail0 to run with the <p> sandboxing profile,\n"
 "               which is a convenient way to express multiple flags\n"
@@ -626,6 +669,8 @@ static const char help_text[] =
 "Uncommon options:\n"
 "  --allow-speculative-execution\n"
 "               Allow speculative execution by disabling mitigations.\n"
+"  --enable-profile-fs-restrictions\n"
+"               Limit paths available when using minimalistic-mountns.\n"
 "  --fs-default-paths\n"
 "               Adds a set of allowed paths to allow running common system \n"
 "               executables.\n"
@@ -637,6 +682,17 @@ static const char help_text[] =
 "               Adds an allowed read-write path.\n"
 "  --fs-path-advanced-rw\n"
 "               Adds an allowed advanced read-write path.\n"
+"  --no-fs-restrictions\n"
+"               Disables path-based filesystem restrictions.\n"
+"  --no-default-runtime-environment\n"
+"               Disables default seccomp policy and setting of no_new_privs.\n"
+"  --no-new-sessions\n"
+"               Skips having Minijail call setsid(). This is useful when\n"
+"               running a process that expects to have a controlling\n"
+"               terminal set.\n"
+"  --preserve-fd\n"
+"               Preserves an fd and makes it available in the child process.\n"
+"               The fd is preserved with the same integer value.\n"
 "  --preload-library=<file>\n"
 "               Overrides the path to \"" PRELOADPATH "\".\n"
 "               This is only really useful for local testing.\n"
@@ -692,17 +748,25 @@ static int getopt_from_conf(const struct option *longopts,
 	/* Look up a matching long option. */
 	size_t i = 0;
 	const struct option *curr_opt;
+	bool long_option_found = false;
 	for (curr_opt = &longopts[0]; curr_opt->name != NULL;
 	     curr_opt = &longopts[++i])
-		if (streq(entry->key, curr_opt->name))
+		if (streq(entry->key, curr_opt->name)) {
+			long_option_found = true;
+			opt = curr_opt->val;
 			break;
-	if (curr_opt->name == NULL) {
+		}
+
+	/* Look up matching short option. */
+	if (!long_option_found && strlen(entry->key) == 1 &&
+	    isalpha(*entry->key) && strchr(optstring, *entry->key) != NULL) {
+		opt = *entry->key;
+	} else if (curr_opt->name == NULL) {
 		errx(1,
 		     "Unable to recognize '%s' as Minijail conf entry key, "
 		     "please refer to minijail0(5) for syntax and examples.",
 		     entry->key);
 	}
-	opt = curr_opt->val;
 	optarg = (char *)entry->value;
 	(*conf_index)++;
 	return opt;
@@ -711,7 +775,7 @@ static int getopt_from_conf(const struct option *longopts,
 /*
  * Similar to getopt(3), return the next option char/value as it
  * parses through the CLI argument list. Config entries in
- * |*conf_entry_list| will be parsed with precendences over cli options.
+ * |*conf_entry_list| will be parsed with precedence over CLI options.
  * Same as getopt(3), |optarg| is pointing to the option argument.
  */
 static int getopt_conf_or_cli(int argc, char *const argv[],
@@ -727,13 +791,40 @@ static int getopt_conf_or_cli(int argc, char *const argv[],
 	return opt;
 }
 
+static char *getname_from_opt(int opt)
+{
+	unsigned int i;
+	const struct option *entry = long_options;
+
+	for (i = 0; i < ARRAY_SIZE(long_options); i++) {
+		if (opt == entry->val) {
+			return xstrdup(entry->name);
+		}
+		entry++;
+	}
+	return NULL;
+}
+
+static void free_options_list(struct option_entry *opt_entry_head)
+{
+	while (opt_entry_head) {
+		struct option_entry *entry = opt_entry_head;
+		opt_entry_head = opt_entry_head->next;
+		free(entry->name);
+		free(entry->args);
+		free(entry);
+	}
+}
+
 static void set_child_env(char ***envp, char *arg, char *const environ[])
 {
 	/* We expect VAR=value format for arg. */
 	char *delim = strchr(arg, '=');
 	if (!delim) {
-		errx(1, "Expected an argument of the "
-		        "form VAR=value (got '%s')", arg);
+		errx(1,
+		     "Expected an argument of the "
+		     "form VAR=value (got '%s')",
+		     arg);
 	}
 	*delim = '\0';
 	const char *env_value = delim + 1;
@@ -751,50 +842,89 @@ static void set_child_env(char ***envp, char *arg, char *const environ[])
 }
 
 int parse_args(struct minijail *j, int argc, char *const argv[],
-	       char *const environ[], int *exit_immediately,
-	       ElfType *elftype, const char **preload_path,
-	       char ***envp)
+	       char *const environ[], bool *exit_immediately, ElfType *elftype,
+	       const char **preload_path, char ***envp)
 {
-	enum seccomp_type { None, Strict, Filter, BpfBinaryFilter };
+	enum seccomp_type {
+		None,
+		Strict,
+		Filter,
+		BpfBinaryFilter
+	};
 	enum seccomp_type seccomp = None;
 	int opt;
-	int use_seccomp_filter = 0;
-	int use_seccomp_filter_binary = 0;
-	int use_seccomp_log = 0;
-	int forward = 1;
-	int binding = 0;
-	int chroot = 0, pivot_root = 0;
-	int mount_ns = 0, change_remount = 0;
-	const char *remount_mode = NULL;
-	int inherit_suppl_gids = 0, keep_suppl_gids = 0;
-	int caps = 0, ambient_caps = 0;
-	bool use_uid = false, use_gid = false;
+	bool use_seccomp_filter = false;
+	bool use_seccomp_filter_binary = false;
+	bool use_seccomp_log = false;
+	bool forward_signals = true;
+	bool have_bind_mounts = false;
+	bool chroot = false;
+	bool pivot_root = false;
+	bool use_mount_ns = false;
+	bool change_remount = false;
+	char *remount_mode = NULL;
+	bool inherit_suppl_gids = false;
+	bool keep_suppl_gids = false;
+	bool caps = false;
+	bool use_ambient_caps = false;
+	bool use_uid = false;
+	bool use_gid = false;
 	uid_t uid = 0;
 	gid_t gid = 0;
 	gid_t *suppl_gids = NULL;
 	size_t suppl_gids_count = 0;
 	char *uidmap = NULL, *gidmap = NULL;
-	int set_uidmap = 0, set_gidmap = 0;
+	bool set_uidmap = false;
+	bool set_gidmap = false;
 	size_t tmp_size = 0;
-	const char *filter_path = NULL;
+	attribute_cleanup_str char *filter_path = NULL;
 	int log_to_stderr = -1;
 	struct config_entry_list *conf_entry_list = NULL;
 	size_t conf_index = 0;
+	bool parse_mode = false;
+	struct option_entry *opt_entry_head = NULL;
+	struct option_entry *opt_entry_tail = NULL;
+	char *config_path = NULL;
+	bool fs_path_flag_used = false;
+	bool fs_path_rules_enabled = true;
 
 	while ((opt = getopt_conf_or_cli(argc, argv, &conf_entry_list,
 					 &conf_index)) != -1) {
+
+		/* Track options for conf file generation. */
+		struct option_entry *opt_entry = calloc(1, sizeof(*opt_entry));
+		char *opt_name = getname_from_opt(opt);
+		if (opt_name != NULL) {
+			opt_entry->name = opt_name;
+		} else {
+			char str[2] = {opt, '\0'};
+			opt_entry->name = xstrdup(str);
+		}
+		if (optarg != NULL) {
+			opt_entry->args = xstrdup(optarg);
+		}
+
+		if (opt_entry_head) {
+			opt_entry_tail->next = opt_entry;
+		} else {
+			opt_entry_head = opt_entry;
+		}
+		opt_entry_tail = opt_entry;
+
 		switch (opt) {
 		case 'u':
 			if (use_uid)
 				errx(1, "-u provided multiple times.");
 			use_uid = true;
-			set_user(j, optarg, &uid, &gid);
+			if (!parse_mode)
+				set_user(j, optarg, &uid, &gid);
 			break;
 		case 'g':
 			if (use_gid)
 				errx(1, "-g provided multiple times.");
 			use_gid = true;
-			set_group(j, optarg, &gid);
+			if (!parse_mode)
+				set_group(j, optarg, &gid);
 			break;
 		case 'n':
 			minijail_no_new_privs(j);
@@ -814,8 +944,9 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			}
 			seccomp = Filter;
 			minijail_use_seccomp_filter(j);
-			filter_path = optarg;
-			use_seccomp_filter = 1;
+			free(filter_path);
+			filter_path = xstrdup(optarg);
+			use_seccomp_filter = true;
 			break;
 		case 'l':
 			minijail_namespace_ipc(j);
@@ -825,35 +956,39 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 				errx(1, "-L does not work with "
 					"--seccomp-bpf-binary");
 			}
-			use_seccomp_log = 1;
+			use_seccomp_log = true;
 			minijail_log_seccomp_filter_failures(j);
 			break;
 		case 'b':
-			add_binding(j, optarg);
-			binding = 1;
+			if (!parse_mode)
+				add_binding(j, optarg);
+			have_bind_mounts = true;
 			break;
 		case 'B':
 			skip_securebits(j, optarg);
 			break;
 		case 'c':
-			caps = 1;
+			caps = true;
 			use_caps(j, optarg);
 			break;
 		case 'C':
 			use_chroot(j, optarg, &chroot, pivot_root);
 			break;
 		case 'k':
-			add_mount(j, optarg);
+			if (!parse_mode)
+				add_mount(j, optarg);
 			break;
 		case 'K':
-			remount_mode = optarg;
-			change_remount = 1;
+			free(remount_mode);
+			remount_mode = optarg == NULL ? NULL : xstrdup(optarg);
+			change_remount = true;
 			break;
 		case 'P':
 			use_pivot_root(j, optarg, &pivot_root, chroot);
 			break;
 		case 'f':
-			if (0 != minijail_write_pid_file(j, optarg))
+			if (!parse_mode &&
+			    0 != minijail_write_pid_file(j, optarg))
 				errx(1, "Could not prepare pid file path");
 			break;
 		case 't':
@@ -865,9 +1000,13 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 				 */
 				tmp_size = DEFAULT_TMP_SIZE;
 			}
-			if (optarg != NULL &&
-			    0 != parse_size(&tmp_size, optarg)) {
-				errx(1, "Invalid /tmp tmpfs size");
+			if (optarg) {
+				uint64_t parsed_size;
+				if (parse_size(&parsed_size, optarg))
+					errx(1, "Invalid /tmp tmpfs size");
+				if (parsed_size > SIZE_MAX)
+					errx(1, "/tmp tmpfs size too large");
+				tmp_size = parsed_size;
 			}
 			break;
 		case 'v':
@@ -903,10 +1042,11 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			 * won't do anything.
 			 */
 			minijail_remount_mode(j, MS_SLAVE);
-			mount_ns = 1;
+			use_mount_ns = true;
 			break;
 		case 'V':
-			minijail_namespace_enter_vfs(j, optarg);
+			if (!parse_mode)
+				minijail_namespace_enter_vfs(j, optarg);
 			break;
 		case 'r':
 			minijail_remount_proc_readonly(j);
@@ -915,13 +1055,13 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			if (keep_suppl_gids)
 				errx(1, "-y and -G are not compatible");
 			minijail_inherit_usergroups(j);
-			inherit_suppl_gids = 1;
+			inherit_suppl_gids = true;
 			break;
 		case 'y':
 			if (inherit_suppl_gids)
 				errx(1, "-y and -G are not compatible");
 			minijail_keep_supplementary_gids(j);
-			keep_suppl_gids = 1;
+			keep_suppl_gids = true;
 			break;
 		case 'N':
 			minijail_namespace_cgroups(j);
@@ -930,13 +1070,15 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			minijail_namespace_pids(j);
 			break;
 		case 'e':
-			if (optarg)
-				minijail_namespace_enter_net(j, optarg);
-			else
-				minijail_namespace_net(j);
+			if (!parse_mode) {
+				if (optarg)
+					minijail_namespace_enter_net(j, optarg);
+				else
+					minijail_namespace_net(j);
+			}
 			break;
 		case 'i':
-			*exit_immediately = 1;
+			*exit_immediately = true;
 			break;
 		case 'H':
 			seccomp_filter_usage(argv[0]);
@@ -950,7 +1092,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			minijail_namespace_pids(j);
 			break;
 		case 'm':
-			set_uidmap = 1;
+			set_uidmap = true;
 			if (uidmap) {
 				free(uidmap);
 				uidmap = NULL;
@@ -959,7 +1101,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 				uidmap = xstrdup(optarg);
 			break;
 		case 'M':
-			set_gidmap = 1;
+			set_gidmap = true;
 			if (gidmap) {
 				free(gidmap);
 				gidmap = NULL;
@@ -991,7 +1133,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			minijail_set_seccomp_filter_tsync(j);
 			break;
 		case 'z':
-			forward = 0;
+			forward_signals = false;
 			break;
 		case 'd':
 			minijail_namespace_vfs(j);
@@ -999,7 +1141,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			break;
 		/* Long options. */
 		case OPT_AMBIENT:
-			ambient_caps = 1;
+			use_ambient_caps = true;
 			minijail_set_ambient_caps(j);
 			break;
 		case OPT_UTS:
@@ -1022,35 +1164,64 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			use_profile(j, optarg, &pivot_root, chroot, &tmp_size);
 			break;
 		case OPT_PRELOAD_LIBRARY:
-			*preload_path = optarg;
+			*preload_path = optarg == NULL ? NULL : xstrdup(optarg);
+			break;
+		case OPT_ENABLE_PROFILE_FS_RESTRICTIONS:
+			minijail_set_enable_profile_fs_restrictions(j);
 			break;
 		case OPT_FS_DEFAULT_PATHS:
 			minijail_enable_default_fs_restrictions(j);
+			fs_path_flag_used = true;
 			break;
 		case OPT_FS_PATH_RX:
 			minijail_add_fs_restriction_rx(j, optarg);
+			fs_path_flag_used = true;
 			break;
 		case OPT_FS_PATH_RO:
 			minijail_add_fs_restriction_ro(j, optarg);
+			fs_path_flag_used = true;
 			break;
 		case OPT_FS_PATH_RW:
 			minijail_add_fs_restriction_rw(j, optarg);
+			fs_path_flag_used = true;
 			break;
 		case OPT_FS_PATH_ADVANCED_RW:
 			minijail_add_fs_restriction_advanced_rw(j, optarg);
+			fs_path_flag_used = true;
 			break;
+		case OPT_NO_FS_RESTRICTIONS:
+			minijail_disable_fs_restrictions(j);
+			fs_path_rules_enabled = false;
+			break;
+		case OPT_NO_DEFAULT_RUNTIME:
+			minijail_set_enable_default_runtime(j, false);
+			break;
+		case OPT_NO_NEW_SESSIONS:
+			minijail_set_enable_new_sessions(j, false);
+			break;
+		case OPT_PRESERVE_FD: {
+			char *fd_end;
+			int fd_to_preserve = strtol(optarg, &fd_end, 10);
+			if (*fd_end != '\0') {
+				errx(1, "--preserve-fd must be an integer");
+			}
+
+			minijail_preserve_fd(j, fd_to_preserve, fd_to_preserve);
+			break;
+		}
 		case OPT_SECCOMP_BPF_BINARY:
 			if (seccomp != None && seccomp != BpfBinaryFilter) {
 				errx(1, "Do not use -s, -S, or "
 					"--seccomp-bpf-binary together");
 			}
-			if (use_seccomp_log == 1)
+			if (use_seccomp_log)
 				errx(1, "-L does not work with "
 					"--seccomp-bpf-binary");
 			seccomp = BpfBinaryFilter;
 			minijail_use_seccomp_filter(j);
-			filter_path = optarg;
-			use_seccomp_filter_binary = 1;
+			free(filter_path);
+			filter_path = xstrdup(optarg);
+			use_seccomp_filter_binary = true;
 			break;
 		case OPT_ADD_SUPPL_GROUP:
 			suppl_group_add(&suppl_gids_count, &suppl_gids, optarg);
@@ -1106,6 +1277,11 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			}
 			break;
 		}
+		case OPT_GEN_CONFIG:
+			parse_mode = true;
+			free(config_path);
+			config_path = xstrdup(optarg);
+			break;
 		case OPT_ENV_ADD:
 			/*
 			 * We either copy our current env to the child env
@@ -1153,6 +1329,45 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 		}
 	}
 
+	if (fs_path_flag_used && !fs_path_rules_enabled) {
+		errx(1, "Can't combine --no-fs-restrictions "
+			"with directly using fs path flags");
+	}
+
+	/* Handle config file generation. */
+	if (parse_mode) {
+		const struct option_entry *r = opt_entry_head;
+		if (access(config_path, F_OK) == 0) {
+			errx(1, "'%s' exists. Specify a new filename.",
+			     config_path);
+		}
+		attribute_cleanup_fp FILE *fp = fopen(config_path, "w");
+		if (fp == NULL) {
+			err(1, "'%s' not writable. Specify a new filename.",
+			    config_path);
+		}
+
+		fprintf(fp, "%% minijail-config-file v0\n\n");
+		while (r != NULL) {
+			/* Add all flags except --config and --gen-config. */
+			if (!streq(r->name, config_flag_name) &&
+			    !streq(r->name, gen_config_flag_name)) {
+				if (r->args == NULL) {
+					fprintf(fp, "%s\n", r->name);
+				} else {
+					fprintf(fp, "%s = %s\n", r->name,
+						r->args);
+				}
+			}
+			r = r->next;
+		}
+
+		exit(0);
+	}
+	free_options_list(opt_entry_head);
+	opt_entry_head = NULL;
+	opt_entry_tail = NULL;
+
 	/* Set up uid/gid mapping. */
 	if (set_uidmap || set_gidmap) {
 		set_ugid_mapping(j, set_uidmap, uid, uidmap, set_gidmap, gid,
@@ -1160,20 +1375,20 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 	}
 
 	/* Can only set ambient caps when using regular caps. */
-	if (ambient_caps && !caps) {
+	if (use_ambient_caps && !caps) {
 		errx(1, "Can't set ambient capabilities (--ambient) "
 			"without actually using capabilities (-c)");
 	}
 
 	/* Set up signal handlers in minijail unless asked not to. */
-	if (forward)
+	if (forward_signals)
 		minijail_forward_signals(j);
 
 	/*
 	 * Only allow bind mounts when entering a chroot, using pivot_root, or
 	 * a new mount namespace.
 	 */
-	if (binding && !(chroot || pivot_root || mount_ns)) {
+	if (have_bind_mounts && !(chroot || pivot_root || use_mount_ns)) {
 		errx(1, "Bind mounts require a chroot, pivot_root, or "
 			" new mount namespace");
 	}
@@ -1182,7 +1397,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 	 * / is only remounted when entering a new mount namespace, so unless
 	 * that's set there is no need for the -K/-K<mode> flags.
 	 */
-	if (change_remount && !mount_ns) {
+	if (change_remount && !use_mount_ns) {
 		errx(1, "No need to use -K (skip remounting '/') or "
 			"-K<mode> (remount '/' as <mode>) "
 			"without -v (new mount namespace).\n"
@@ -1215,15 +1430,24 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 	if (use_seccomp_filter) {
 		minijail_parse_seccomp_filters(j, filter_path);
 	} else if (use_seccomp_filter_binary) {
-		struct sock_fprog filter;
-		read_seccomp_filter(filter_path, &filter);
-		minijail_set_seccomp_filters(j, &filter);
-		free((void *)filter.filter);
+		set_seccomp_filters(j, filter_path);
+	} else if (minijail_get_enable_default_runtime(j)) {
+		if (access(default_policy_path, F_OK) == 0) {
+			/* TODO(b/254506006): support more flags for runtime
+			 * options. */
+			minijail_use_seccomp_filter(j);
+			set_seccomp_filters(j, default_policy_path);
+		}
+		/* Set no_new_privs in addition to the seccomp policy. */
+		minijail_no_new_privs(j);
 	}
 
 	/* Mount a tmpfs under /tmp and set its size. */
 	if (tmp_size)
 		minijail_mount_tmp_size(j, tmp_size);
+
+	/* Add Landlock rules for each processed mount arg. */
+	minijail_add_minimalistic_mountns_fs_rules(j);
 
 	/*
 	 * Copy our current env to the child if its |*envp| has not
@@ -1268,7 +1492,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 	 * use of ambient capabilities for them to be able to survive an
 	 * execve(2).
 	 */
-	if (caps && *elftype == ELFSTATIC && !ambient_caps) {
+	if (caps && *elftype == ELFSTATIC && !use_ambient_caps) {
 		errx(1, "Can't run statically-linked binaries with capabilities"
 			" (-c) without also setting ambient capabilities. "
 			"Try passing --ambient.");

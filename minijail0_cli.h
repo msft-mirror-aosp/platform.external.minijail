@@ -8,6 +8,8 @@
 #ifndef MINIJAIL_MINIJAIL0_CLI_H_
 #define MINIJAIL_MINIJAIL0_CLI_H_
 
+#include <stdbool.h>
+
 #include "elfparse.h"
 
 #ifdef __cplusplus
@@ -17,12 +19,11 @@ extern "C" {
 struct minijail;
 
 int parse_args(struct minijail *j, int argc, char *const argv[],
-	       char *const environ[], int *exit_immediately,
-	       ElfType *elftype, const char **preload_path,
-	       char ***envp);
+	       char *const environ[], bool *exit_immediately, ElfType *elftype,
+	       const char **preload_path, char ***envp);
 
 #ifdef __cplusplus
 }; /* extern "C" */
 #endif
 
-#endif  /* MINIJAIL_MINIJAIL0_CLI_H_ */
+#endif /* MINIJAIL_MINIJAIL0_CLI_H_ */

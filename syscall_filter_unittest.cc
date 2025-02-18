@@ -10,6 +10,7 @@
 #include <fcntl.h> /* For O_WRONLY. */
 
 #include <gtest/gtest.h>
+#include <span>
 #include <string>
 
 #include "bpf.h"
@@ -28,50 +29,48 @@ enum ret_trap {
 };
 
 enum use_logging {
-  NO_LOGGING          = 0,
-  USE_SIGSYS_LOGGING  = 1,
+  NO_LOGGING = 0,
+  USE_SIGSYS_LOGGING = 1,
   USE_RET_LOG_LOGGING = 2,
 };
 
-int test_compile_filter(
-    const std::string& filename,
-    FILE* policy_file,
-    struct sock_fprog* prog,
-    enum block_action action = ACTION_RET_KILL,
-    enum use_logging allow_logging = NO_LOGGING,
-    bool allow_dup_syscalls = true) {
+int test_compile_filter(const std::string& filename,
+                        FILE* policy_file,
+                        struct sock_fprog* prog,
+                        enum block_action action = ACTION_RET_KILL,
+                        enum use_logging allow_logging = NO_LOGGING,
+                        bool allow_dup_syscalls = true,
+                        bool include_libc_compatibility_allowlist = false) {
   struct filter_options filteropts {
-    .action = action,
-    .allow_logging = allow_logging != NO_LOGGING,
+    .action = action, .allow_logging = allow_logging != NO_LOGGING,
     .allow_syscalls_for_logging = allow_logging == USE_SIGSYS_LOGGING,
     .allow_duplicate_syscalls = allow_dup_syscalls,
+    .include_libc_compatibility_allowlist =
+        include_libc_compatibility_allowlist,
   };
   return compile_filter(filename.c_str(), policy_file, prog, &filteropts);
 }
 
-int test_compile_file(
-    std::string filename,
-    FILE* policy_file,
-    struct filter_block* head,
-    struct filter_block** arg_blocks,
-    struct bpf_labels* labels,
-    enum block_action action = ACTION_RET_KILL,
-    enum use_logging allow_logging = NO_LOGGING,
-    unsigned int include_level = 0,
-    bool allow_dup_syscalls = false) {
+int test_compile_file(std::string filename,
+                      FILE* policy_file,
+                      struct filter_block* head,
+                      struct filter_block** arg_blocks,
+                      struct bpf_labels* labels,
+                      enum block_action action = ACTION_RET_KILL,
+                      enum use_logging allow_logging = NO_LOGGING,
+                      unsigned int include_level = 0,
+                      bool allow_dup_syscalls = false) {
   struct filter_options filteropts {
-    .action = action,
-    .allow_logging = allow_logging != NO_LOGGING,
+    .action = action, .allow_logging = allow_logging != NO_LOGGING,
     .allow_syscalls_for_logging = allow_logging == USE_SIGSYS_LOGGING,
     .allow_duplicate_syscalls = allow_dup_syscalls,
+    .include_libc_compatibility_allowlist = false,
   };
   size_t num_syscalls = get_num_syscalls();
-  struct parser_state **previous_syscalls =
-      (struct parser_state **)calloc(num_syscalls,
-                                     sizeof(struct parser_state *));
+  struct parser_state** previous_syscalls =
+      (struct parser_state**)calloc(num_syscalls, sizeof(struct parser_state*));
   int res = compile_file(filename.c_str(), policy_file, head, arg_blocks,
-                         labels, &filteropts, previous_syscalls,
-                         include_level);
+                         labels, &filteropts, previous_syscalls, include_level);
   free_previous_syscalls(previous_syscalls);
   return res;
 }
@@ -83,10 +82,14 @@ struct filter_block* test_compile_policy_line(
     unsigned int label_id,
     struct bpf_labels* labels,
     enum block_action action = ACTION_RET_KILL) {
-  return compile_policy_line(state, nr, policy_line.c_str(), label_id,
-           labels, action);
+  return compile_policy_line(state, nr, policy_line.c_str(), label_id, labels,
+                             action);
 }
 
+std::span<const char *const> get_libc_compatibility_allowlist() {
+  return std::span(libc_compatibility_syscalls,
+                   libc_compatibility_syscalls_len);
+}
 }  // namespace
 
 /* Test that setting one BPF instruction works. */
@@ -151,8 +154,8 @@ TEST(bpf, bpf_comp_jset) {
 #if defined(BITS32)
   EXPECT_EQ_BLOCK(&comp_jset[0], BPF_JMP + BPF_JSET + BPF_K, mask, jt, jf);
 #elif defined(BITS64)
-  EXPECT_EQ_BLOCK(
-      &comp_jset[0], BPF_JMP + BPF_JSET + BPF_K, 0x80000000, jt + 2, 0);
+  EXPECT_EQ_BLOCK(&comp_jset[0], BPF_JMP + BPF_JSET + BPF_K, 0x80000000, jt + 2,
+                  0);
   EXPECT_EQ_STMT(&comp_jset[1], BPF_LD + BPF_MEM, 0);
   EXPECT_EQ_BLOCK(&comp_jset[2], BPF_JMP + BPF_JSET + BPF_K, O_WRONLY, jt, jf);
 #endif
@@ -171,15 +174,15 @@ TEST(bpf, bpf_comp_jin) {
 #if defined(BITS32)
   EXPECT_EQ_BLOCK(&comp_jin[0], BPF_JMP + BPF_JSET + BPF_K, ~mask, jf, jt);
 #elif defined(BITS64)
-  EXPECT_EQ_BLOCK(
-      &comp_jin[0], BPF_JMP + BPF_JSET + BPF_K, 0x7FFFFFFF, jf + 2, 0);
+  EXPECT_EQ_BLOCK(&comp_jin[0], BPF_JMP + BPF_JSET + BPF_K, 0x7FFFFFFF, jf + 2,
+                  0);
   EXPECT_EQ_STMT(&comp_jin[1], BPF_LD + BPF_MEM, 0);
   EXPECT_EQ_BLOCK(&comp_jin[2], BPF_JMP + BPF_JSET + BPF_K, ~O_WRONLY, jf, jt);
 #endif
 }
 
 TEST(bpf, bpf_arg_comp) {
-  struct sock_filter *arg_comp;
+  struct sock_filter* arg_comp;
   int op = EQ;
   const int argidx = 1;
   unsigned long c = 3;
@@ -204,6 +207,19 @@ TEST(bpf, bpf_arg_comp) {
   EXPECT_EQ_BLOCK(&arg_comp[6], BPF_JMP + BPF_JEQ + BPF_K, c, 1, 0);
   EXPECT_JUMP_LBL(&arg_comp[7]);
 #endif
+  free(arg_comp);
+}
+
+TEST(bpf, bpf_arg_comp_invalid) {
+  struct sock_filter* arg_comp;
+  int op = MIN_OPERATOR + 32;
+  const int argidx = 1;
+  unsigned long c = 3;
+  unsigned int label_id = 0;
+
+  size_t len = bpf_arg_comp(&arg_comp, op, argidx, c, label_id);
+
+  EXPECT_EQ(len, 0);
   free(arg_comp);
 }
 
@@ -323,7 +339,7 @@ TEST_F(BpfLabelTest, too_many_labels) {
 
   for (i = 0; i < BPF_LABELS_MAX; i++) {
     snprintf(label, 20, "test%u", i);
-    (void) bpf_label_id(&labels_, label);
+    (void)bpf_label_id(&labels_, label);
   }
   int id = bpf_label_id(&labels_, "test");
 
@@ -390,7 +406,7 @@ TEST_F(ArgFilterTest, arg0_equals) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -595,7 +611,7 @@ TEST_F(ArgFilterTest, arg0_mask) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -635,7 +651,7 @@ TEST_F(ArgFilterTest, arg0_flag_set_inclusion) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -676,7 +692,7 @@ TEST_F(ArgFilterTest, arg0_eq_mask) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -718,7 +734,7 @@ TEST_F(ArgFilterTest, and_or) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -773,7 +789,7 @@ TEST_F(ArgFilterTest, ret_errno) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -802,8 +818,7 @@ TEST_F(ArgFilterTest, ret_errno) {
   curr_block = curr_block->next;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
-  EXPECT_EQ_STMT(curr_block->instrs,
-                 BPF_RET + BPF_K,
+  EXPECT_EQ_STMT(curr_block->instrs, BPF_RET + BPF_K,
                  SECCOMP_RET_ERRNO | (1 & SECCOMP_RET_DATA));
 
   /* Seventh block is "SUCCESS" label and SECCOMP_RET_ALLOW. */
@@ -826,7 +841,7 @@ TEST_F(ArgFilterTest, unconditional_errno) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -835,8 +850,7 @@ TEST_F(ArgFilterTest, unconditional_errno) {
   curr_block = curr_block->next;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
-  EXPECT_EQ_STMT(curr_block->instrs,
-                 BPF_RET + BPF_K,
+  EXPECT_EQ_STMT(curr_block->instrs, BPF_RET + BPF_K,
                  SECCOMP_RET_ERRNO | (1 & SECCOMP_RET_DATA));
 
   EXPECT_EQ(curr_block->next, nullptr);
@@ -903,16 +917,15 @@ TEST_F(ArgFilterTest, invalid_errno) {
 TEST_F(ArgFilterTest, log_no_ret_error) {
   std::string fragment = "arg0 == 0";
 
-  struct filter_block* block =
-      test_compile_policy_line(&state_, nr_, fragment, id_, &labels_,
-                               ACTION_RET_TRAP);
+  struct filter_block* block = test_compile_policy_line(
+      &state_, nr_, fragment, id_, &labels_, ACTION_RET_TRAP);
 
   ASSERT_NE(block, nullptr);
   size_t exp_total_len = 1 + (BPF_ARG_COMP_LEN + 1) + 2 + 1 + 2;
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -952,7 +965,7 @@ TEST_F(ArgFilterTest, log_bad_ret_error) {
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -987,15 +1000,14 @@ TEST_F(ArgFilterTest, log_bad_ret_error) {
 TEST_F(ArgFilterTest, no_log_bad_ret_error) {
   std::string fragment = "arg0 == 0; return";
 
-  struct filter_block* block =
-      test_compile_policy_line(&state_, nr_, fragment, id_, &labels_,
-                               ACTION_RET_TRAP);
+  struct filter_block* block = test_compile_policy_line(
+      &state_, nr_, fragment, id_, &labels_, ACTION_RET_TRAP);
   ASSERT_NE(block, nullptr);
   size_t exp_total_len = 1 + (BPF_ARG_COMP_LEN + 1) + 2 + 1 + 2;
   EXPECT_EQ(block->total_len, exp_total_len);
 
   /* First block is a label. */
-  struct filter_block *curr_block = block;
+  struct filter_block* curr_block = block;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_EQ(curr_block->len, 1U);
   EXPECT_LBL(curr_block->instrs);
@@ -1043,20 +1055,19 @@ class FileTest : public ::testing::Test {
     free_block_list(arg_blocks_);
   }
   struct bpf_labels labels_;
-  struct filter_block *head_;
-  struct filter_block *arg_blocks_;
+  struct filter_block* head_;
+  struct filter_block* arg_blocks_;
 };
 
 }  // namespace
 
 TEST_F(FileTest, malformed_policy) {
-  std::string policy =
-      "malformed";
+  std::string policy = "malformed";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
-  int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
-                              &labels_);
+  int res =
+      test_compile_file("policy", policy_file, head_, &arg_blocks_, &labels_);
   fclose(policy_file);
 
   /*
@@ -1072,8 +1083,8 @@ TEST_F(FileTest, double_free_on_compile_error) {
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
-  int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
-                              &labels_);
+  int res =
+      test_compile_file("policy", policy_file, head_, &arg_blocks_, &labels_);
   fclose(policy_file);
 
   /*
@@ -1083,13 +1094,12 @@ TEST_F(FileTest, double_free_on_compile_error) {
 }
 
 TEST_F(FileTest, invalid_return) {
-  std::string policy =
-      "read:arg0 == 0; ;";
+  std::string policy = "read:arg0 == 0; ;";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
-  int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
-                              &labels_);
+  int res =
+      test_compile_file("policy", policy_file, head_, &arg_blocks_, &labels_);
   fclose(policy_file);
 
   /*
@@ -1097,6 +1107,81 @@ TEST_F(FileTest, invalid_return) {
    */
   ASSERT_EQ(res, -1);
 }
+
+TEST_F(FileTest, seccomp_global_allowlist) {
+  std::string policy = "";
+  FILE *policy_file = write_to_pipe(policy);
+  ASSERT_NE(policy_file, nullptr);
+
+  struct sock_fprog actual;
+  int res = test_compile_filter("policy", policy_file, &actual, ACTION_RET_KILL,
+        NO_LOGGING, false /* allow_dup_syscalls */,
+        true /* include_libc_compatibility_allowlist */);
+  fclose(policy_file);
+
+  ASSERT_EQ(res, 0);
+  std::span<const char *const> allowlist = get_libc_compatibility_allowlist();
+  size_t offset_after_allowlist =
+    ARCH_VALIDATION_LEN + 1 + 2 * allowlist.size();
+  EXPECT_EQ(actual.len, offset_after_allowlist + 1);
+  EXPECT_ARCH_VALIDATION(actual.filter);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
+                 BPF_LD + BPF_W + BPF_ABS, syscall_nr);
+  for (size_t i = 0; i < allowlist.size(); ++i) {
+    int allowlist_entry_nr = lookup_syscall(allowlist[i], nullptr);
+    EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1 + 2 * i,
+                         allowlist_entry_nr);
+  }
+  EXPECT_EQ_STMT(actual.filter + offset_after_allowlist, BPF_RET + BPF_K,
+                 SECCOMP_RET_KILL);
+
+  free(actual.filter);
+}
+
+TEST_F(FileTest, seccomp_global_allowlist_does_not_conflict) {
+  std::string policy;
+  for (const char *entry : get_libc_compatibility_allowlist()) {
+    policy += entry;
+    policy += ": 1\n";
+  }
+
+  FILE* policy_file = write_to_pipe(policy);
+  ASSERT_NE(policy_file, nullptr);
+
+  struct sock_fprog actual;
+  int res = test_compile_filter("policy", policy_file, &actual, ACTION_RET_KILL,
+        NO_LOGGING, false /* allow_dup_syscalls */,
+        true /* include_libc_compatibility_allowlist */);
+  fclose(policy_file);
+
+  ASSERT_EQ(res, 0);
+  std::span<const char *const> allowlist = get_libc_compatibility_allowlist();
+
+  /* NOTE: due to how the global allowlist is added, this results in duplicate
+   * allowlist entries in `actual` when both the global allowlist & the given
+   * policy share a syscall. This is suboptimal, but the existence of global
+   * allowlist entries is highly discouraged & the list should remain empty most
+   * of the time. When it does contain entries, it should generally contain
+   * fewer than five.
+   */
+  size_t offset_after_allowlist =
+      ARCH_VALIDATION_LEN + 1 + 4 * allowlist.size();
+  EXPECT_EQ(actual.len, offset_after_allowlist + 1);
+  EXPECT_ARCH_VALIDATION(actual.filter);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
+                 syscall_nr);
+  for (size_t i = 0; i < allowlist.size() * 2; ++i) {
+    int allowlist_entry_nr = lookup_syscall(allowlist[i % allowlist.size()],
+                                            nullptr);
+    EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1 + 2 * i,
+                         allowlist_entry_nr);
+  }
+  EXPECT_EQ_STMT(actual.filter + offset_after_allowlist, BPF_RET + BPF_K,
+                 SECCOMP_RET_KILL);
+
+  free(actual.filter);
+}
+
 
 TEST_F(FileTest, seccomp_mode1) {
   std::string policy =
@@ -1107,15 +1192,15 @@ TEST_F(FileTest, seccomp_mode1) {
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
-  int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
-                              &labels_);
+  int res =
+      test_compile_file("policy", policy_file, head_, &arg_blocks_, &labels_);
   fclose(policy_file);
 
   /*
    * Checks return value and that the blocks only allow expected syscalls.
    */
   ASSERT_EQ(res, 0);
-  struct filter_block *curr_block = head_;
+  struct filter_block* curr_block = head_;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_ALLOW_SYSCALL(curr_block->instrs, __NR_read);
   curr_block = curr_block->next;
@@ -1142,8 +1227,8 @@ TEST_F(FileTest, seccomp_read) {
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
-  int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
-                              &labels_);
+  int res =
+      test_compile_file("policy", policy_file, head_, &arg_blocks_, &labels_);
   fclose(policy_file);
 
   /*
@@ -1151,12 +1236,9 @@ TEST_F(FileTest, seccomp_read) {
    * labels between |head_| and |arg_blocks_| match.
    */
   ASSERT_EQ(res, 0);
-  struct filter_block *curr_block = head_;
+  struct filter_block* curr_block = head_;
   ASSERT_NE(curr_block, nullptr);
-  EXPECT_ALLOW_SYSCALL_ARGS(curr_block->instrs,
-                            __NR_read,
-                            LABEL_ID,
-                            JUMP_JT,
+  EXPECT_ALLOW_SYSCALL_ARGS(curr_block->instrs, __NR_read, LABEL_ID, JUMP_JT,
                             JUMP_JF);
   curr_block = curr_block->next;
   ASSERT_NE(curr_block, nullptr);
@@ -1209,8 +1291,8 @@ TEST_F(FileTest, multiline) {
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
-  int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
-                              &labels_);
+  int res =
+      test_compile_file("policy", policy_file, head_, &arg_blocks_, &labels_);
   fclose(policy_file);
 
   /*
@@ -1219,17 +1301,14 @@ TEST_F(FileTest, multiline) {
   ASSERT_EQ(res, 0);
 
   /* First block is the read. */
-  struct filter_block *curr_block = head_;
+  struct filter_block* curr_block = head_;
   ASSERT_NE(curr_block, nullptr);
   EXPECT_ALLOW_SYSCALL(curr_block->instrs, __NR_read);
 
   /* Second block is the open. */
   curr_block = curr_block->next;
   ASSERT_NE(curr_block, nullptr);
-  EXPECT_ALLOW_SYSCALL_ARGS(curr_block->instrs,
-                            __NR_openat,
-                            LABEL_ID,
-                            JUMP_JT,
+  EXPECT_ALLOW_SYSCALL_ARGS(curr_block->instrs, __NR_openat, LABEL_ID, JUMP_JT,
                             JUMP_JF);
 
   EXPECT_EQ(curr_block->next, nullptr);
@@ -1257,16 +1336,14 @@ TEST(FilterTest, seccomp_mode1) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-                 BPF_LD + BPF_W + BPF_ABS,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
                  syscall_nr);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3, __NR_write);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 5,
                        __NR_rt_sigreturn);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7, __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9,
-                 BPF_RET + BPF_K,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET + BPF_K,
                  SECCOMP_RET_KILL);
 
   free(actual.filter);
@@ -1283,9 +1360,9 @@ TEST(FilterTest, seccomp_mode1_with_check) {
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
 
-  int res = test_compile_filter("policy", policy_file, &actual,
-                                ACTION_RET_KILL, NO_LOGGING, false
-                                /* allow duplicate syscalls */);
+  int res = test_compile_filter(
+      "policy", policy_file, &actual, ACTION_RET_KILL, NO_LOGGING, false
+      /* allow duplicate syscalls */);
   fclose(policy_file);
 
   /*
@@ -1296,16 +1373,14 @@ TEST(FilterTest, seccomp_mode1_with_check) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-                 BPF_LD + BPF_W + BPF_ABS,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
                  syscall_nr);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3, __NR_write);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 5,
                        __NR_rt_sigreturn);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7, __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9,
-                 BPF_RET + BPF_K,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET + BPF_K,
                  SECCOMP_RET_KILL);
 
   free(actual.filter);
@@ -1359,10 +1434,10 @@ TEST(FilterTest, duplicate_read_with_one_arg) {
 TEST(FilterTest, seccomp_mode1_trap) {
   struct sock_fprog actual;
   std::string policy =
-    "read: 1\n"
-    "write: 1\n"
-    "rt_sigreturn: 1\n"
-    "exit: 1\n";
+      "read: 1\n"
+      "write: 1\n"
+      "rt_sigreturn: 1\n"
+      "exit: 1\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
@@ -1379,18 +1454,15 @@ TEST(FilterTest, seccomp_mode1_trap) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-      BPF_LD+BPF_W+BPF_ABS, syscall_nr);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1,
-      __NR_read);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3,
-      __NR_write);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
+                 syscall_nr);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3, __NR_write);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 5,
-      __NR_rt_sigreturn);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7,
-      __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET+BPF_K,
-      SECCOMP_RET_TRAP);
+                       __NR_rt_sigreturn);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7, __NR_exit);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET + BPF_K,
+                 SECCOMP_RET_TRAP);
 
   free(actual.filter);
 }
@@ -1398,10 +1470,10 @@ TEST(FilterTest, seccomp_mode1_trap) {
 TEST(FilterTest, seccomp_mode1_log) {
   struct sock_fprog actual;
   std::string policy =
-    "read: 1\n"
-    "write: 1\n"
-    "rt_sigreturn: 1\n"
-    "exit: 1\n";
+      "read: 1\n"
+      "write: 1\n"
+      "rt_sigreturn: 1\n"
+      "exit: 1\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
@@ -1418,18 +1490,15 @@ TEST(FilterTest, seccomp_mode1_log) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-      BPF_LD+BPF_W+BPF_ABS, syscall_nr);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1,
-      __NR_read);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3,
-      __NR_write);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
+                 syscall_nr);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3, __NR_write);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 5,
-      __NR_rt_sigreturn);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7,
-      __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET+BPF_K,
-      SECCOMP_RET_LOG);
+                       __NR_rt_sigreturn);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7, __NR_exit);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET + BPF_K,
+                 SECCOMP_RET_LOG);
 
   free(actual.filter);
 }
@@ -1437,10 +1506,10 @@ TEST(FilterTest, seccomp_mode1_log) {
 TEST(FilterTest, seccomp_mode1_log_fails) {
   struct sock_fprog actual;
   std::string policy =
-    "read: 1\n"
-    "write: 1\n"
-    "rt_sigreturn: 1\n"
-    "exit: 1\n";
+      "read: 1\n"
+      "write: 1\n"
+      "rt_sigreturn: 1\n"
+      "exit: 1\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
@@ -1458,16 +1527,16 @@ TEST(FilterTest, seccomp_mode1_log_fails) {
 TEST(FilterTest, seccomp_mode1_ret_kill_process) {
   struct sock_fprog actual;
   std::string policy =
-    "read: 1\n"
-    "write: 1\n"
-    "rt_sigreturn: 1\n"
-    "exit: 1\n";
+      "read: 1\n"
+      "write: 1\n"
+      "rt_sigreturn: 1\n"
+      "exit: 1\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
 
-  int res = test_compile_filter("policy", policy_file, &actual, ACTION_RET_KILL_PROCESS,
-                                NO_LOGGING);
+  int res = test_compile_filter("policy", policy_file, &actual,
+                                ACTION_RET_KILL_PROCESS, NO_LOGGING);
   fclose(policy_file);
 
   /*
@@ -1478,18 +1547,15 @@ TEST(FilterTest, seccomp_mode1_ret_kill_process) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-      BPF_LD+BPF_W+BPF_ABS, syscall_nr);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1,
-      __NR_read);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3,
-      __NR_write);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
+                 syscall_nr);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 3, __NR_write);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 5,
-      __NR_rt_sigreturn);
-  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7,
-      __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET+BPF_K,
-      SECCOMP_RET_KILL_PROCESS);
+                       __NR_rt_sigreturn);
+  EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7, __NR_exit);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET + BPF_K,
+                 SECCOMP_RET_KILL_PROCESS);
 
   free(actual.filter);
 }
@@ -1519,21 +1585,16 @@ TEST(FilterTest, seccomp_read_write) {
   EXPECT_EQ(actual.len, exp_total_len);
 
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-                 BPF_LD + BPF_W + BPF_ABS,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
                  syscall_nr);
-  EXPECT_ALLOW_SYSCALL_ARGS(
-      actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read, 7, 0, 0);
-  EXPECT_ALLOW_SYSCALL_ARGS(actual.filter + ARCH_VALIDATION_LEN + 3,
-                            __NR_write,
-                            12 + BPF_ARG_COMP_LEN,
-                            0,
-                            0);
+  EXPECT_ALLOW_SYSCALL_ARGS(actual.filter + ARCH_VALIDATION_LEN + 1, __NR_read,
+                            7, 0, 0);
+  EXPECT_ALLOW_SYSCALL_ARGS(actual.filter + ARCH_VALIDATION_LEN + 3, __NR_write,
+                            12 + BPF_ARG_COMP_LEN, 0, 0);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 5,
                        __NR_rt_sigreturn);
   EXPECT_ALLOW_SYSCALL(actual.filter + ARCH_VALIDATION_LEN + 7, __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9,
-                 BPF_RET + BPF_K,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN + 9, BPF_RET + BPF_K,
                  SECCOMP_RET_KILL);
 
   free(actual.filter);
@@ -1551,9 +1612,8 @@ TEST(FilterTest, misplaced_whitespace) {
 
   /* Checks return value and filter length. */
   ASSERT_EQ(res, 0);
-  EXPECT_EQ(actual.len,
-            ARCH_VALIDATION_LEN + 1 /* load syscall nr */ + ALLOW_SYSCALL_LEN +
-                1 /* ret kill */);
+  EXPECT_EQ(actual.len, ARCH_VALIDATION_LEN + 1 /* load syscall nr */ +
+                            ALLOW_SYSCALL_LEN + 1 /* ret kill */);
   free(actual.filter);
 }
 
@@ -1650,8 +1710,7 @@ TEST(FilterTest, log) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13 + 2 * log_syscalls_len);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-                 BPF_LD + BPF_W + BPF_ABS,
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
                  syscall_nr);
 
   index = ARCH_VALIDATION_LEN + 1;
@@ -1673,10 +1732,10 @@ TEST(FilterTest, log) {
 TEST(FilterTest, allow_log_but_kill) {
   struct sock_fprog actual;
   std::string policy =
-    "read: 1\n"
-    "write: 1\n"
-    "rt_sigreturn: 1\n"
-    "exit: 1\n";
+      "read: 1\n"
+      "write: 1\n"
+      "rt_sigreturn: 1\n"
+      "exit: 1\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
@@ -1697,8 +1756,8 @@ TEST(FilterTest, allow_log_but_kill) {
   ASSERT_EQ(res, 0);
   EXPECT_EQ(actual.len, 13 + 2 * log_syscalls_len);
   EXPECT_ARCH_VALIDATION(actual.filter);
-  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN,
-      BPF_LD+BPF_W+BPF_ABS, syscall_nr);
+  EXPECT_EQ_STMT(actual.filter + ARCH_VALIDATION_LEN, BPF_LD + BPF_W + BPF_ABS,
+                 syscall_nr);
 
   index = ARCH_VALIDATION_LEN + 1;
   for (i = 0; i < log_syscalls_len; i++)
@@ -1711,8 +1770,7 @@ TEST(FilterTest, allow_log_but_kill) {
   EXPECT_ALLOW_SYSCALL(actual.filter + index + 2, __NR_write);
   EXPECT_ALLOW_SYSCALL(actual.filter + index + 4, __NR_rt_sigreturn);
   EXPECT_ALLOW_SYSCALL(actual.filter + index + 6, __NR_exit);
-  EXPECT_EQ_STMT(actual.filter + index + 8, BPF_RET+BPF_K,
-      SECCOMP_RET_KILL);
+  EXPECT_EQ_STMT(actual.filter + index + 8, BPF_RET + BPF_K, SECCOMP_RET_KILL);
 
   free(actual.filter);
 }
@@ -1874,8 +1932,7 @@ TEST(FilterTest, include) {
 
   EXPECT_ARCH_VALIDATION(compiled_with_include.filter);
   EXPECT_EQ_STMT(compiled_with_include.filter + ARCH_VALIDATION_LEN,
-                 BPF_LD + BPF_W + BPF_ABS,
-                 syscall_nr);
+                 BPF_LD + BPF_W + BPF_ABS, syscall_nr);
   EXPECT_ALLOW_SYSCALL(compiled_with_include.filter + ARCH_VALIDATION_LEN + 1,
                        __NR_read);
   EXPECT_ALLOW_SYSCALL(compiled_with_include.filter + ARCH_VALIDATION_LEN + 3,
@@ -1885,8 +1942,7 @@ TEST(FilterTest, include) {
   EXPECT_ALLOW_SYSCALL(compiled_with_include.filter + ARCH_VALIDATION_LEN + 7,
                        __NR_exit);
   EXPECT_EQ_STMT(compiled_with_include.filter + ARCH_VALIDATION_LEN + 9,
-                 BPF_RET + BPF_K,
-                 SECCOMP_RET_KILL);
+                 BPF_RET + BPF_K, SECCOMP_RET_KILL);
 
   free(compiled_plain.filter);
   free(compiled_with_include.filter);
@@ -1899,7 +1955,8 @@ TEST(FilterTest, include_same_syscalls) {
       "write: 1\n"
       "rt_sigreturn: 1\n"
       "exit: 1\n"
-      "@include " + source_path("test/seccomp.policy") + "\n";
+      "@include " +
+      source_path("test/seccomp.policy") + "\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
@@ -1908,9 +1965,9 @@ TEST(FilterTest, include_same_syscalls) {
   fclose(policy_file);
 
   ASSERT_EQ(res, 0);
-  EXPECT_EQ(actual.len,
-            ARCH_VALIDATION_LEN + 1 /* load syscall nr */ +
-                2 * 8 /* check syscalls twice */ + 1 /* filter return */);
+  EXPECT_EQ(actual.len, ARCH_VALIDATION_LEN + 1 /* load syscall nr */ +
+                            2 * 8 /* check syscalls twice */ +
+                            1 /* filter return */);
   free(actual.filter);
 }
 
@@ -1921,14 +1978,15 @@ TEST(FilterTest, include_same_syscalls_with_check) {
       "write: 1\n"
       "rt_sigreturn: 1\n"
       "exit: 1\n"
-      "@include " + source_path("test/seccomp.policy") + "\n";
+      "@include " +
+      source_path("test/seccomp.policy") + "\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
 
-  int res = test_compile_filter("policy", policy_file, &actual,
-                                ACTION_RET_KILL, NO_LOGGING, false
-                                /* allow duplicate syscalls */);
+  int res = test_compile_filter(
+      "policy", policy_file, &actual, ACTION_RET_KILL, NO_LOGGING, false
+      /* allow duplicate syscalls */);
   fclose(policy_file);
 
   ASSERT_EQ(res, -1);
@@ -1936,9 +1994,8 @@ TEST(FilterTest, include_same_syscalls_with_check) {
 
 TEST(FilterTest, include_two) {
   struct sock_fprog actual;
-  std::string policy =
-      "@include " + source_path("test/seccomp.policy") + "\n" +
-      "@include " + source_path("test/seccomp.policy") + "\n";
+  std::string policy = "@include " + source_path("test/seccomp.policy") + "\n" +
+                       "@include " + source_path("test/seccomp.policy") + "\n";
 
   FILE* policy_file = write_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
@@ -1947,9 +2004,9 @@ TEST(FilterTest, include_two) {
   fclose(policy_file);
 
   ASSERT_EQ(res, 0);
-  EXPECT_EQ(actual.len,
-            ARCH_VALIDATION_LEN + 1 /* load syscall nr */ +
-                2 * 8 /* check syscalls twice */ + 1 /* filter return */);
+  EXPECT_EQ(actual.len, ARCH_VALIDATION_LEN + 1 /* load syscall nr */ +
+                            2 * 8 /* check syscalls twice */ +
+                            1 /* filter return */);
   free(actual.filter);
 }
 
@@ -1966,8 +2023,8 @@ TEST(FilterTest, include_invalid_policy) {
   ASSERT_NE(policy_file, nullptr);
 
   /* Ensure the included (invalid) policy file exists. */
-  FILE* included_file = fopen(
-      source_path("test/invalid_syscall_name.policy").c_str(), "re");
+  FILE* included_file =
+      fopen(source_path("test/invalid_syscall_name.policy").c_str(), "re");
   ASSERT_NE(included_file, nullptr);
   fclose(included_file);
 
