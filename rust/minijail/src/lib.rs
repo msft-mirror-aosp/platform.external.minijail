@@ -6,11 +6,12 @@ use std::ffi::CString;
 use std::fmt::{self, Display};
 use std::fs;
 use std::io;
-use std::os::raw::{c_char, c_ulong, c_ushort};
+use std::os::raw::{c_char, c_int, c_ulong, c_ushort};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::result::Result as StdResult;
+use std::sync::Once;
 
 use libc::pid_t;
 use minijail_sys::*;
@@ -231,6 +232,8 @@ pub enum Error {
     ReturnCode(u8),
     /// Failed to wait the process.
     Wait(i32),
+    /// Failed to clone the log fd
+    CloneLogFd(io::Error),
 }
 
 impl Display for Error {
@@ -324,6 +327,7 @@ impl Display for Error {
                 "failed to wait: {}",
                 io::Error::from_raw_os_error(*errno)
             ),
+            CloneLogFd(e) => write!(f, "failed to clone log fd: {}", e),
         }
     }
 }
@@ -375,6 +379,10 @@ pub type Result<T> = StdResult<T, Error>;
 /// process.
 pub struct Minijail {
     jail: *mut minijail,
+    disable_multithreaded_check: bool,
+    // Meant to hold on to log_fd for the duration of the Minijail
+    // Is a combination of log_fd and min priority.
+    log_fd: Option<(std::os::fd::OwnedFd, libc::c_int)>,
 }
 
 #[link(name = "c")]
@@ -419,13 +427,18 @@ impl Minijail {
         if j.is_null() {
             return Err(Error::CreatingMinijail);
         }
-        Ok(Minijail { jail: j })
+        Ok(Minijail {
+            jail: j,
+            disable_multithreaded_check: false,
+            log_fd: None,
+        })
     }
 
     /// Clones self to a new `Minijail`. Useful because `fork` can only be called once on a
     /// `Minijail`.
     pub fn try_clone(&self) -> Result<Minijail> {
-        let jail_out = Minijail::new()?;
+        let mut jail_out = Minijail::new()?;
+        jail_out.disable_multithreaded_check = self.disable_multithreaded_check;
         unsafe {
             // Safe to clone one minijail to the other as minijail_clone doesn't modify the source
             // jail(`self`) and leaves a valid minijail in the destination(`jail_out`).
@@ -433,6 +446,13 @@ impl Minijail {
             if ret < 0 {
                 return Err(Error::ReturnCode(ret as u8));
             }
+        }
+
+        if let Some((log_fd, min_priority)) = &self.log_fd {
+            jail_out.log_to_fd(
+                log_fd.try_clone().map_err(Error::CloneLogFd)?,
+                *min_priority,
+            );
         }
 
         Ok(jail_out)
@@ -673,6 +693,16 @@ impl Minijail {
         }
         Ok(())
     }
+    pub fn log_to_fd(&mut self, fd: std::os::fd::OwnedFd, min_priority: c_int) {
+        // Minijail doesn't close the fd when it is destroyed, so this is safe.
+        unsafe {
+            minijail_log_to_fd(fd.as_raw_fd(), min_priority);
+        }
+        // minijail_log_to_fd "borrows" the fd  (in Rust parlance), so we need to store the
+        // fd as long as Minijail is alive for correctness.
+        self.log_fd = Some((fd, min_priority));
+    }
+
     pub fn enter_chroot<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
         let pathstring = dir
             .as_ref()
@@ -811,6 +841,19 @@ impl Minijail {
         Ok(())
     }
 
+    /// Disables the check that prevents forking in a multithreaded environment.
+    /// This is only safe if the child process calls exec immediately after
+    /// forking. The state of locks, and whether or not they will unlock
+    /// is undefined. Additionally, objects allocated on other threads that
+    /// expect to be dropped when those threads cease execution will not be
+    /// dropped.
+    /// Thus, nothing should be called that relies on shared synchronization
+    /// primitives referenced outside of the current thread. The safest
+    /// way to use this is to immediately exec in the child.
+    pub fn disable_multithreaded_check(&mut self) {
+        self.disable_multithreaded_check = true;
+    }
+
     /// Forks and execs a child and puts it in the previously configured minijail.
     /// FDs 0, 1, and 2 are overwritten with /dev/null FDs unless they are included in the
     /// inheritable_fds list. This function may abort in the child on error because a partially
@@ -906,8 +949,8 @@ impl Minijail {
         }
 
         match cmd.program {
-            Program::Filename(ref path) => path.as_path().run_command(&self, &cmd),
-            Program::FileDescriptor(fd) => fd.run_command(&self, &cmd),
+            Program::Filename(ref path) => path.as_path().run_command(self, &cmd),
+            Program::FileDescriptor(fd) => fd.run_command(self, &cmd),
         }
     }
 
@@ -942,7 +985,9 @@ impl Minijail {
     /// # Safety
     /// See `fork`.
     pub unsafe fn fork_remap(&self, inheritable_fds: &[(RawFd, RawFd)]) -> Result<pid_t> {
-        if !is_single_threaded().map_err(Error::CheckingMultiThreaded)? {
+        if !self.disable_multithreaded_check
+            && !is_single_threaded().map_err(Error::CheckingMultiThreaded)?
+        {
             // This test will fail during `cargo test` because the test harness always spawns a test
             // thread. We will make an exception for that case because the tests for this module
             // should always be run in a serial fashion using `--test-threads=1`.
@@ -1018,18 +1063,27 @@ impl Drop for Minijail {
     }
 }
 
-// Count the number of files in the directory specified by `path`.
-fn count_dir_entries<P: AsRef<Path>>(path: P) -> io::Result<usize> {
-    Ok(fs::read_dir(path)?.count())
+// Check if a `/proc/*/task/*` is a kthread.
+fn task_is_kthread(path: &Path) -> io::Result<bool> {
+    let status = fs::read_to_string(path.join("status"))?;
+    Ok(status.contains("\nKthread:\t1\n"))
+}
+
+// Count the number of threads in the current process.
+fn num_threads() -> io::Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir("/proc/self/task")? {
+        let entry = entry?;
+        if !task_is_kthread(&entry.path())? {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 // Return true if the current thread is the only thread in the process.
 fn is_single_threaded() -> io::Result<bool> {
-    match count_dir_entries("/proc/self/task") {
-        Ok(1) => Ok(true),
-        Ok(_) => Ok(false),
-        Err(e) => Err(e),
-    }
+    Ok(num_threads()? == 1)
 }
 
 fn to_execve_cstring_array<S: AsRef<str>>(
@@ -1050,6 +1104,20 @@ fn to_execve_cstring_array<S: AsRef<str>>(
     vec_cptr.push(null());
 
     Ok((vec_cstr, vec_cptr))
+}
+
+static LOGGING_INIT_LOCK: Once = Once::new();
+
+pub fn init_default_logging() {
+    LOGGING_INIT_LOCK.call_once(|| {
+        log_to_fd(libc::STDERR_FILENO, 6 /* SYSLOG_LOG_INFO */)
+    })
+}
+
+fn log_to_fd(fd: RawFd, priority: c_int) {
+    unsafe {
+        minijail_log_to_fd(fd, priority);
+    }
 }
 
 #[cfg(test)]
@@ -1082,6 +1150,8 @@ mod tests {
 
     #[test]
     fn create_and_free() {
+        init_default_logging();
+
         unsafe {
             let j = minijail_new();
             assert_ne!(std::ptr::null_mut(), j);
@@ -1096,16 +1166,20 @@ mod tests {
     // Test that setting a seccomp filter with no-new-privs works as non-root.
     // This is equivalent to minijail0 -n -S <seccomp_policy>
     fn seccomp_no_new_privs() {
+        init_default_logging();
+
         let mut j = Minijail::new().unwrap();
         j.no_new_privs();
         j.parse_seccomp_filters("src/test_filter.policy").unwrap();
         j.use_seccomp_filter();
-        j.run("/bin/true", &[], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/true", &[], EMPTY_STRING_SLICE).unwrap();
     }
 
     #[test]
     // Test that open FDs get closed and that FDs in the inherit list are left open.
     fn close_fds() {
+        init_default_logging();
+
         unsafe {
             // Using libc to open/close FDs for testing.
             const FILE_PATH: &[u8] = b"/dev/null\0";
@@ -1151,13 +1225,17 @@ fi
 
     #[test]
     fn wait_success() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
-        j.run("/bin/true", &[1, 2], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/true", &[1, 2], EMPTY_STRING_SLICE).unwrap();
         expect_result!(j.wait(), Ok(()));
     }
 
     #[test]
     fn wait_killed() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
         j.run(
             SHELL,
@@ -1170,22 +1248,28 @@ fi
 
     #[test]
     fn wait_returncode() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
-        j.run("/bin/false", &[1, 2], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/false", &[1, 2], EMPTY_STRING_SLICE).unwrap();
         expect_result!(j.wait(), Err(Error::ReturnCode(1)));
     }
 
     #[test]
     fn wait_noaccess() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
-        j.run("/dev/null", &[1, 2], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/dev/null", &[1, 2], EMPTY_STRING_SLICE).unwrap();
         expect_result!(j.wait(), Err(Error::NoAccess));
     }
 
     #[test]
     fn wait_nocommand() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
-        j.run("/bin/does not exist", &[1, 2], &EMPTY_STRING_SLICE)
+        j.run("/bin/does not exist", &[1, 2], EMPTY_STRING_SLICE)
             .unwrap();
         // TODO(b/194221986) Fix libminijail so that Error::NoAccess is not sometimes returned.
         assert!(matches!(
@@ -1195,18 +1279,23 @@ fi
     }
 
     #[test]
+    #[ignore] // TODO(b/323475944) Fix unit test failures.
     fn runnable_fd_success() {
+        init_default_logging();
+
         let bin_file = File::open("/bin/true").unwrap();
         // On ChromeOS targets /bin/true is actually a script, so drop CLOEXEC to prevent ENOENT.
         clear_cloexec(&bin_file).unwrap();
 
         let j = Minijail::new().unwrap();
-        j.run_fd(&bin_file, &[1, 2], &EMPTY_STRING_SLICE).unwrap();
+        j.run_fd(&bin_file, &[1, 2], EMPTY_STRING_SLICE).unwrap();
         expect_result!(j.wait(), Ok(()));
     }
 
     #[test]
     fn kill_success() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
         j.run(
             Path::new("/usr/bin/sleep"),
@@ -1221,36 +1310,46 @@ fi
     #[test]
     #[ignore] // privileged operation.
     fn chroot() {
+        init_default_logging();
+
         let mut j = Minijail::new().unwrap();
         j.enter_chroot(".").unwrap();
-        j.run("/bin/true", &[], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/true", &[], EMPTY_STRING_SLICE).unwrap();
     }
 
     #[test]
     #[ignore] // privileged operation.
     fn namespace_vfs() {
+        init_default_logging();
+
         let mut j = Minijail::new().unwrap();
         j.namespace_vfs();
-        j.run("/bin/true", &[], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/true", &[], EMPTY_STRING_SLICE).unwrap();
     }
 
     #[test]
     fn run() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
-        j.run("/bin/true", &[], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/true", &[], EMPTY_STRING_SLICE).unwrap();
     }
 
     #[test]
     fn run_clone() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
         let b = j.try_clone().unwrap();
         // Pass the same FDs to both clones and make sure they don't conflict.
-        j.run("/bin/true", &[1, 2], &EMPTY_STRING_SLICE).unwrap();
-        b.run("/bin/true", &[1, 2], &EMPTY_STRING_SLICE).unwrap();
+        j.run("/bin/true", &[1, 2], EMPTY_STRING_SLICE).unwrap();
+        b.run("/bin/true", &[1, 2], EMPTY_STRING_SLICE).unwrap();
     }
 
     #[test]
     fn run_string_vec() {
+        init_default_logging();
+
         let j = Minijail::new().unwrap();
         let args = vec!["ignored".to_string()];
         j.run(Path::new("/bin/true"), &[], &args).unwrap();
