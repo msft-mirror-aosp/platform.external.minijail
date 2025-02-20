@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -380,7 +381,10 @@ TEST(Test, minijail_preserve_fd_no_leak) {
     )";
   char* const argv[] = {"sh", "-c", script, nullptr};
 
-  const int high_fd = 99999;
+  struct rlimit limit {};
+  ASSERT_EQ(0, getrlimit(RLIMIT_NOFILE, &limit));
+  const int high_fd = limit.rlim_cur - 1;
+
   const int npipes = 4;
   int fds[npipes][2];
 
@@ -391,7 +395,7 @@ TEST(Test, minijail_preserve_fd_no_leak) {
 
   // (b/308042314) Move a pipe to > 1024 to check for a crash.
   ASSERT_FALSE(minijail_fd_is_open(high_fd)) << "high_fd is already in use";
-  ASSERT_EQ(dup2(fds[3][1], high_fd), high_fd);
+  ASSERT_EQ(dup2(fds[3][1], high_fd), high_fd) << strerror(errno);
   EXPECT_EQ(close(fds[3][1]), 0);
   fds[3][1] = high_fd;
 
