@@ -10,6 +10,7 @@
 #define _UTIL_H_
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,8 +54,17 @@ extern "C" {
  *   foo([1] int, [2] const char *format, [3] ...): format=2 check=3
  *   foo([1] const char *format, [2] const char *, [3] ...): format=1 check=3
  */
-#define attribute_printf(format_idx, check_idx) \
+#define attribute_printf(format_idx, check_idx)                                \
 	__attribute__((__format__(__printf__, format_idx, check_idx)))
+
+/*
+ * The specified function arguments may not be NULL.  Params starts counting
+ * from 1, not 0.  If no params are specified, then all function arguments are
+ * marked as non-NULL.  Thus, params should only be specified if a function
+ * accepts NULL pointers for any of the arguments.
+ * NB: Keep in sync with libminijail.h style.
+ */
+#define attribute_nonnull(params) __attribute__((__nonnull__ params))
 
 #ifndef __cplusplus
 /* If writing C++, use std::unique_ptr with a destructor instead. */
@@ -65,8 +75,7 @@ extern "C" {
  * Make sure any variable using this is always initialized to something.
  * @func The function to call on (a pointer to) the variable.
  */
-#define attribute_cleanup(func) \
-	__attribute__((__cleanup__(func)))
+#define attribute_cleanup(func) __attribute__((__cleanup__(func)))
 
 /*
  * Automatically close a FILE* when exiting its scope.
@@ -143,6 +152,9 @@ static inline void _cleanup_str(char **ptr)
 
 extern const char *const log_syscalls[];
 extern const size_t log_syscalls_len;
+
+extern const char *const libc_compatibility_syscalls[];
+extern const size_t libc_compatibility_syscalls_len;
 
 enum logging_system_t {
 	/* Log to syslog. This is the default. */
@@ -244,19 +256,33 @@ static inline size_t get_num_syscalls(void)
 	return syscall_table_size;
 }
 
-int lookup_syscall(const char *name, size_t *ind);
-const char *lookup_syscall_name(int nr);
+int lookup_syscall(const char *name, size_t *ind) attribute_nonnull((1));
+const char *lookup_syscall_name(long nr);
 
-long int parse_single_constant(char *constant_str, char **endptr);
-long int parse_constant(char *constant_str, char **endptr);
-int parse_size(size_t *size, const char *sizespec);
+long int parse_single_constant(char *constant_str, char **endptr)
+    attribute_nonnull();
+long int parse_constant(char *constant_str, char **endptr)
+    attribute_nonnull((1));
 
-char *strip(char *s);
+/*
+ * parse_size: parse a string to a positive integer bytes with optional suffix.
+ * @size     The output parsed size, in bytes
+ * @sizespec The input string to parse
+ *
+ * A single 1-char suffix is supported like "10K" or "6G".  These use base 1024,
+ * not base 1000.  i.e. "1K" is "1024".  It is case-sensitive.
+ *
+ * Returns 0 on success, negative errno on failure.
+ * Only writes to |size| on success.
+ */
+int parse_size(uint64_t *size, const char *sizespec) attribute_nonnull();
+
+char *strip(char *s) attribute_nonnull();
 
 /*
  * streq: determine whether two strings are equal.
  */
-static inline bool streq(const char *s1, const char *s2)
+attribute_nonnull() static inline bool streq(const char *s1, const char *s2)
 {
 	return strcmp(s1, s2) == 0;
 }
@@ -274,14 +300,15 @@ static inline bool streq(const char *s1, const char *s2)
  */
 char *tokenize(char **stringp, const char *delim);
 
-char *path_join(const char *external_path, const char *internal_path);
+char *path_join(const char *external_path, const char *internal_path)
+    attribute_nonnull();
 
 /*
  * path_is_parent: checks whether @parent is a parent of @child.
  * Note: this function does not evaluate '.' or '..' nor does it resolve
  * symlinks.
  */
-bool path_is_parent(const char *parent, const char *child);
+bool path_is_parent(const char *parent, const char *child) attribute_nonnull();
 
 /*
  * consumebytes: consumes @length bytes from a buffer @buf of length @buflength
@@ -291,7 +318,8 @@ bool path_is_parent(const char *parent, const char *child);
  *
  * Returns a pointer to the base of the bytes, or NULL for errors.
  */
-void *consumebytes(size_t length, char **buf, size_t *buflength);
+void *consumebytes(size_t length, char **buf, size_t *buflength)
+    attribute_nonnull();
 
 /*
  * consumestr: consumes a C string from a buffer @buf of length @length
@@ -300,7 +328,7 @@ void *consumebytes(size_t length, char **buf, size_t *buflength);
  *
  * Returns a pointer to the base of the string, or NULL for errors.
  */
-char *consumestr(char **buf, size_t *buflength);
+char *consumestr(char **buf, size_t *buflength) attribute_nonnull();
 
 /*
  * init_logging: initializes the module-wide logging.
@@ -361,7 +389,8 @@ int minijail_setenv(char ***env, const char *name, const char *value,
  *
  * Returns number of bytes read or -1 on failure to read (including EOF).
  */
-ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream);
+ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream)
+    attribute_nonnull();
 
 /*
  * minjail_getenv: Get an environment variable from @envp. Semantics match the

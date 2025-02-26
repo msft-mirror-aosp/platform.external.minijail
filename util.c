@@ -35,47 +35,79 @@
  */
 const char *const log_syscalls[] = {
 #if defined(__x86_64__)
-# if defined(__ANDROID__)
-  "socket", "connect", "fcntl", "writev",
-# else
-  "socket", "connect", "sendto", "writev",
-# endif
-#elif defined(__i386__)
-# if defined(__ANDROID__)
-  "socketcall", "writev", "fcntl64", "clock_gettime",
-# else
-  "socketcall", "time", "writev",
-# endif
-#elif defined(__arm__)
-# if defined(__ANDROID__)
-  "clock_gettime", "connect", "fcntl64", "socket", "writev",
-# else
-  "socket", "connect", "gettimeofday", "send", "writev",
-# endif
-#elif defined(__aarch64__)
-# if defined(__ANDROID__)
-  "connect", "fcntl", "sendto", "socket", "writev",
-# else
-  "socket", "connect", "send", "writev",
-# endif
-#elif defined(__hppa__) || \
-      defined(__ia64__) || \
-      defined(__mips__) || \
-      defined(__powerpc__) || \
-      defined(__sparc__)
-  "socket", "connect", "send",
-#elif defined(__riscv)
-# if defined(__ANDROID__)
-  "connect", "fcntl", "sendto", "socket", "writev",
-# else
-  "socket", "connect", "sendto",
-# endif
+#if defined(__ANDROID__)
+    "socket",
+    "connect",
+    "fcntl",
+    "writev",
 #else
-# error "Unsupported platform"
+    "socket",
+    "connect",
+    "sendto",
+    "writev",
+#endif
+#elif defined(__i386__)
+#if defined(__ANDROID__)
+    "socketcall",
+    "writev",
+    "fcntl64",
+    "clock_gettime",
+#else
+    "socketcall",
+    "time",
+    "writev",
+#endif
+#elif defined(__arm__)
+#if defined(__ANDROID__)
+    "clock_gettime", "connect", "fcntl64", "socket", "writev",
+#else
+    "socket", "connect", "gettimeofday", "send", "writev",
+#endif
+#elif defined(__aarch64__)
+#if defined(__ANDROID__)
+    "connect", "fcntl", "sendto", "socket", "writev",
+#else
+    "socket",
+    "connect",
+    "send",
+    "writev",
+#endif
+#elif defined(__hppa__) || defined(__ia64__) || defined(__mips__) ||           \
+    defined(__powerpc__) || defined(__sparc__)
+    "socket",
+    "connect",
+    "send",
+#elif defined(__riscv)
+#if defined(__ANDROID__)
+    "connect", "fcntl", "sendto", "socket", "writev",
+#else
+    "socket",
+    "connect",
+    "sendto",
+#endif
+#else
+#error "Unsupported platform"
 #endif
 };
 
 const size_t log_syscalls_len = ARRAY_SIZE(log_syscalls);
+
+/*
+ * These syscalls are globally allowed. ChromeOS devs: Do **not** add to this
+ * list without approval from the security team.
+ *
+ * This list should be made empty (and mostly remain so) after a better
+ * mechanism is implemented: b/393353891
+ */
+const char *const libc_compatibility_syscalls[] = {
+    "fstat",
+#if defined(__arm__)
+    "fstat64",
+#endif
+};
+
+const size_t libc_compatibility_syscalls_len =
+    ARRAY_SIZE(libc_compatibility_syscalls);
 
 /* clang-format off */
 static struct logging_config_t {
@@ -178,7 +210,7 @@ int lookup_syscall(const char *name, size_t *ind)
 	return -1;
 }
 
-const char *lookup_syscall_name(int nr)
+const char *lookup_syscall_name(long nr)
 {
 	const struct syscall_entry *entry = syscall_table;
 	for (; entry->name && entry->nr >= 0; ++entry)
@@ -268,9 +300,18 @@ static char *tokenize_parenthesized_expression(char **stringp)
 	return NULL;
 }
 
-long int parse_constant(char *constant_str, char **endptr)
+long int parse_constant(char *constant_str_nonnull, char **endptr)
 {
 	long int value = 0, current_value;
+	/*
+	 * The function API says both inputs have to be non-NULL.  The code
+	 * happens to handle NULL pointers because it resuses the input pointer
+	 * as it tokenizes/walks it until the tokenize functions sets it to
+	 * NULL.  But because of the attributes on the function arguments, the
+	 * compiler incorrectly assumes the variable can't become NULL in here,
+	 * so we have to create another variable to effectively cast it away.
+	 */
+	char *constant_str = constant_str_nonnull;
 	char *group, *lastpos = constant_str;
 
 	/*
@@ -348,53 +389,51 @@ long int parse_constant(char *constant_str, char **endptr)
 	return value;
 }
 
-/*
- * parse_size, specified as a string with a decimal number in bytes,
- * possibly with one 1-character suffix like "10K" or "6G".
- * Assumes both pointers are non-NULL.
- *
- * Returns 0 on success, negative errno on failure.
- * Only writes to result on success.
- */
-int parse_size(size_t *result, const char *sizespec)
+int parse_size(uint64_t *result, const char *sizespec)
 {
-	const char prefixes[] = "KMGTPE";
-	size_t i, multiplier = 1, nsize, size = 0;
+	uint64_t size;
 	unsigned long long parsed;
-	const size_t len = strlen(sizespec);
 	char *end;
 
-	if (len == 0 || sizespec[0] == '-')
+	/* strtoull supports leading whitespace, -, and + signs. */
+	if (sizespec[0] < '0' || sizespec[0] > '9')
 		return -EINVAL;
 
-	for (i = 0; i < sizeof(prefixes); ++i) {
-		if (sizespec[len - 1] == prefixes[i]) {
-#if __WORDSIZE == 32
-			if (i >= 3)
-				return -ERANGE;
-#endif
-			multiplier = 1024;
-			while (i-- > 0)
-				multiplier *= 1024;
-			break;
+	/* Clear+check errno so we handle ULLONG_MAX correctly. */
+	errno = 0;
+	parsed = strtoull(sizespec, &end, 10);
+	if (errno)
+		return -errno;
+	size = parsed;
+
+	/* See if there's a suffix. */
+	if (*end != '\0') {
+		static const char suffixes[] = "KMGTPE";
+		size_t i;
+
+		/* Only allow 1 suffix. */
+		if (end[1] != '\0')
+			return -EINVAL;
+
+		for (i = 0; i < sizeof(suffixes) - 1; ++i) {
+			if (*end == suffixes[i]) {
+				/* Make sure we don't overflow. */
+				const int scale = (i + 1) * 10;
+				uint64_t mask =
+				    ~((UINT64_C(1) << (64 - scale)) - 1);
+				if (size & mask)
+					return -ERANGE;
+				size <<= scale;
+				break;
+			}
 		}
+
+		/* Unknown suffix. */
+		if (i == sizeof(suffixes) - 1)
+			return -EINVAL;
 	}
 
-	/* We only need size_t but strtoul(3) is too small on IL32P64. */
-	parsed = strtoull(sizespec, &end, 10);
-	if (parsed == ULLONG_MAX)
-		return -errno;
-	if (parsed >= SIZE_MAX)
-		return -ERANGE;
-	if ((multiplier != 1 && end != sizespec + len - 1) ||
-	    (multiplier == 1 && end != sizespec + len))
-		return -EINVAL;
-	size = (size_t)parsed;
-
-	nsize = size * multiplier;
-	if (nsize / multiplier != size)
-		return -ERANGE;
-	*result = nsize;
+	*result = size;
 	return 0;
 }
 
@@ -537,7 +576,8 @@ char **minijail_copy_env(char *const *env)
  * minijail_getenv, returns true if |name| is found, false if not.
  * If found, |*i| is |name|'s index. If not, |*i| is the length of |envp|.
  */
-static bool getenv_index(char **envp, const char *name, int *i) {
+static bool getenv_index(char **envp, const char *name, int *i)
+{
 	if (!envp || !name || !i)
 		return false;
 
@@ -637,7 +677,8 @@ ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream)
 	return *n - 1;
 }
 
-char *minijail_getenv(char **envp, const char *name) {
+char *minijail_getenv(char **envp, const char *name)
+{
 	if (!envp || !name)
 		return NULL;
 
