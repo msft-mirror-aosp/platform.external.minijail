@@ -2,7 +2,6 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-BASE_VER=0
 include common.mk
 
 LIBDIR ?= /lib
@@ -80,6 +79,14 @@ ifeq ($(BLOCK_SYMLINKS_IN_NONINIT_MOUNTNS_TMP),yes)
 CPPFLAGS += -DBLOCK_SYMLINKS_IN_NONINIT_MOUNTNS_TMP
 endif
 
+# If specified, the `libc_compatibility_syscalls` list will be silently added to
+# all allowlists. Intended for use when upgrading core libraries (mainly libc),
+# which can lead to new syscalls being introduced in many places.
+USE_LIBC_COMPATIBILITY_ALLOWLIST ?= no
+ifeq ($(USE_LIBC_COMPATIBILITY_ALLOWLIST),yes)
+CPPFLAGS += -DALLOW_LIBC_COMPATIBILITY_SYSCALLS
+endif
+
 ifeq ($(USE_ASAN),yes)
 CPPFLAGS += -fsanitize=address -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address -fno-omit-frame-pointer
@@ -108,7 +115,7 @@ UNITTEST_DEPS := testrunner.o test_util.o
 
 USE_SYSTEM_GTEST ?= no
 ifeq ($(USE_SYSTEM_GTEST),no)
-GTEST_CXXFLAGS := -std=gnu++14
+GTEST_CXXFLAGS := -std=gnu++20
 GTEST_LIBS := gtest.a
 UNITTEST_DEPS += $(GTEST_LIBS)
 else
@@ -117,6 +124,7 @@ GTEST_CXXFLAGS := $(shell gtest-config --cxxflags 2>/dev/null || \
 GTEST_LIBS := $(shell gtest-config --libs 2>/dev/null || \
   echo "-lgtest -pthread -lpthread")
 endif
+GTEST_CXXFLAGS += -DGTEST_REMOVE_LEGACY_TEST_CASEAPI_
 UNITTEST_LIBS += $(GTEST_LIBS)
 
 CORE_OBJECT_FILES := libminijail.o syscall_filter.o signal_handler.o \
@@ -250,7 +258,7 @@ $(eval $(call add_object_rules,libconstants.gen.o,CC,c,CFLAGS))
 ifeq ($(USE_SYSTEM_GTEST),no)
 # Points to the root of Google Test, relative to where this file is.
 # Remember to tweak this if you move this file.
-GTEST_DIR = googletest-release-1.11.0/googletest
+GTEST_DIR = googletest-1.14.0/googletest
 
 # Flags passed to the preprocessor.
 # Set Google Test's header directory as a system directory, such that

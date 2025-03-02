@@ -175,6 +175,10 @@ unsigned int get_last_valid_cap(void)
 			pdie("fscanf(%s)", cap_file);
 		fclose(fp);
 	}
+	/* Caps are bitfields stored in 64-bit int. */
+	if (last_valid_cap > 64)
+		pdie("unable to detect last valid cap: %u > 64",
+		     last_valid_cap);
 	return last_valid_cap;
 }
 
@@ -496,9 +500,9 @@ static bool seccomp_action_is_available(const char *wanted)
 		 */
 		return false;
 	}
-	const char actions_avail_path[] =
+	static const char actions_avail_path[] =
 	    "/proc/sys/kernel/seccomp/actions_avail";
-	FILE *f = fopen(actions_avail_path, "re");
+	attribute_cleanup_fp FILE *f = fopen(actions_avail_path, "re");
 
 	if (!f) {
 		pwarn("fopen(%s) failed", actions_avail_path);
@@ -542,6 +546,20 @@ int seccomp_ret_kill_process_available(void)
 	return ret_kill_process_available;
 }
 
+bool sys_set_no_new_privs(void)
+{
+	/*
+	 * Set no_new_privs. See </kernel/seccomp.c> and </kernel/sys.c>
+	 * in the kernel source tree for an explanation of the parameters.
+	 */
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
+		return true;
+	} else {
+		pwarn("prctl(PR_SET_NO_NEW_PRIVS) failed");
+		return false;
+	}
+}
+
 bool seccomp_filter_flags_available(unsigned int flags)
 {
 	return sys_seccomp(SECCOMP_SET_MODE_FILTER, flags, NULL) != -1 ||
@@ -552,6 +570,7 @@ bool is_canonical_path(const char *path)
 {
 	attribute_cleanup_str char *rp = realpath(path, NULL);
 	if (!rp) {
+		pwarn("realpath(%s) failed", path);
 		return false;
 	}
 
