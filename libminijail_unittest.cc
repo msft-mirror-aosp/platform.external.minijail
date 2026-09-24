@@ -1255,7 +1255,7 @@ namespace {
 // clone for more information about failure modes with the CLONE_NEWUSER flag).
 class NamespaceTest : public ::testing::Test {
  protected:
-  static void SetUpTestCase() { userns_supported_ = UsernsSupported(); }
+  static void SetUpTestSuite() { userns_supported_ = UsernsSupported(); }
 
   // Whether userns is supported.
   static bool userns_supported_;
@@ -1779,7 +1779,7 @@ int RunIoctlTestProcess(struct minijail* j) {
 class LandlockTest : public NamespaceTest {
  protected:
   static void SetUpTestSuite() {
-    NamespaceTest::SetUpTestCase();
+    NamespaceTest::SetUpTestSuite();
     run_landlock_tests_ = LandlockSupported() && userns_supported_;
   }
 
